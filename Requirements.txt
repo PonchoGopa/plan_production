@@ -1,0 +1,12 @@
+# Motor de optimización
+ortools>=9.8
+
+# API REST
+flask>=3.0
+flask-cors>=4.0
+
+# Base de datos
+mysql-connector-python>=8.3
+
+# Utilidades
+python-dotenv>=1.0
