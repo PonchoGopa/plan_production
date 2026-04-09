@@ -1,398 +1,306 @@
-"""
-scheduler_pkg/repository.py — Capa de acceso a datos.
+"""Data loading layer for scheduler domain objects.
 
-PRINCIPIOS DE DISEÑO:
-1. No importa Flask. Solo mysql-connector y los modelos propios.
-2. Recibe una conexión MySQL como parámetro (inyección de dependencias).
-   Esto permite:
-   - Pruebas unitarias con una conexión mock
-   - Reutilización en contextos no-Flask (scripts, tests, workers)
-   - Fácil swap de MySQL por SQLite en pruebas
-3. Devuelve SOLO objetos Python (dataclasses). Nunca tuples ni dicts crudos.
-4. Cada función tiene una sola responsabilidad.
+This module is framework-agnostic and returns only Python dataclasses.
 """
 
 from __future__ import annotations
+
+from datetime import date, time, timedelta
 from typing import Any
+
 import mysql.connector
 
-from .models import (
-    Machine, Shift, Part, RouteStep, CycleTime, Order
-)
+from .models import CycleTime, Machine, Order, Part, PlanningData, Route, Shift
 
-
-# ── Tipo interno para la conexión ────────────────────────────────
-# mysql.connector.connection.MySQLConnection no tiene stubs de mypy,
-# usamos Any para evitar ruido en el type checker sin perder claridad.
 Connection = Any
 
 
-# ══════════════════════════════════════════════════════════════════
-# HELPERS INTERNOS
-# ══════════════════════════════════════════════════════════════════
+class RepositoryDataError(RuntimeError):
+    """Raised when source data is missing, inconsistent, or unreadable."""
 
-def _query(conn: Connection, sql: str, params: tuple = ()) -> list[dict]:
-    """
-    Ejecuta una consulta y devuelve filas como lista de dicts.
 
-    Usamos dictionary=True para acceder a los campos por nombre,
-    no por índice. Esto hace el código más robusto ante cambios
-    en el orden de columnas.
-    """
+def _query(conn: Connection, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     cursor = conn.cursor(dictionary=True)
     try:
         cursor.execute(sql, params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        return rows if rows is not None else []
+    except mysql.connector.Error as exc:
+        raise RepositoryDataError(f"Database query failed: {exc}") from exc
     finally:
         cursor.close()
 
 
-# ══════════════════════════════════════════════════════════════════
-# MÁQUINAS
-# ══════════════════════════════════════════════════════════════════
+def _to_minutes(value: Any, field_name: str) -> int:
+    if isinstance(value, timedelta):
+        return int(value.total_seconds() // 60)
+    if isinstance(value, time):
+        return value.hour * 60 + value.minute
+    if isinstance(value, str):
+        parts = value.split(":")
+        if len(parts) >= 2:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            return hours * 60 + minutes
+    raise RepositoryDataError(f"Invalid time value for {field_name}: {value!r}")
 
-def load_machines(conn: Connection, only_active: bool = True) -> dict[int, Machine]:
-    """
-    Carga todas las máquinas activas de la planta.
 
-    Retorna un dict indexado por machine.id para acceso O(1) desde
-    el scheduler (que necesita buscar máquinas por id frecuentemente).
+def _to_date(value: Any, field_name: str) -> date:
+    if isinstance(value, date):
+        return value
+    raise RepositoryDataError(f"Invalid date value for {field_name}: {value!r}")
 
-    La tabla `machines` en la BD tiene: id, Machine, Area.
-    El Excel también muestra: proceso, tonelaje.
-    Adaptamos la query según lo que esté disponible.
 
-    Nota: si la columna `activa` no existe todavía en tu BD,
-    se puede comentar el filtro `AND activa = 1` temporalmente.
-    """
+def _load_machines(conn: Connection, only_active: bool) -> dict[int, Machine]:
     sql = """
-        SELECT id, Machine, Area
+        SELECT id, Machine, Area, proceso, tonelaje_ton, activa
         FROM machines
     """
-    # Si la BD ya tiene columna `activa`, agregar: WHERE activa = 1
-    rows = _query(conn, sql)
+    params: tuple[Any, ...] = ()
+    if only_active:
+        sql += " WHERE activa = %s"
+        params = (1,)
 
+    rows = _query(conn, sql, params)
     machines: dict[int, Machine] = {}
-    for row in rows:
-        # Inferimos el proceso desde el área (la BD actual no tiene columna proceso)
-        area = (row["Area"] or "").upper()
-        proceso = _infer_proceso(area, row["Machine"])
 
-        machines[row["id"]] = Machine(
-            id=row["id"],
-            name=row["Machine"],
-            area=area,
-            proceso=proceso,
-            tonelaje=None,  # se puede enriquecer si se agrega columna tonelaje_ton
-            activa=True,
+    for row in rows:
+        machine_id = int(row["id"])
+        machines[machine_id] = Machine(
+            id=machine_id,
+            name=str(row.get("Machine") or ""),
+            area=str(row.get("Area") or ""),
+            process_name=str(row.get("proceso") or ""),
+            tonnage_ton=float(row["tonelaje_ton"]) if row.get("tonelaje_ton") is not None else None,
+            active=bool(row.get("activa", True)),
         )
 
     return machines
 
 
-def _infer_proceso(area: str, machine_name: str) -> str:
-    """
-    Infiere el proceso a partir del área/nombre de máquina.
-
-    La BD actual usa nombres como MPR-01 (prensa), MSW-02 (soldadura),
-    MAW-01 (soldadura MIG/arco), etc.
-    """
-    name = machine_name.upper()
-    if "MPR" in name or "PRENSA" in area:
-        return "prensa"
-    if "MSW" in name or "MAW" in name or "SOLD" in area:
-        return "soldadura"
-    if "MESA" in name or "ENSAM" in area:
-        return "ensamble"
-    if "PR-5" in name or "INSP" in area or "SHOKI" in area:
-        return "inspeccion"
-    return area.lower() or "desconocido"
-
-
-# ══════════════════════════════════════════════════════════════════
-# TURNOS
-# ══════════════════════════════════════════════════════════════════
-
-def load_shifts(conn: Connection) -> list[Shift]:
-    """
-    Carga los turnos activos desde la tabla `turnos`.
-
-    Si la tabla no existe aún, devuelve los turnos por defecto
-    definidos en config.py. Esto facilita el arranque del sistema
-    antes de que existan todos los datos en la BD.
-
-    hora_inicio / hora_fin son TIME en MySQL → Python los devuelve
-    como timedelta; los convertimos a minutos desde medianoche.
-    """
-    try:
-        rows = _query(conn, "SELECT id, nombre, hora_inicio, hora_fin, activo FROM turnos")
-    except mysql.connector.Error:
-        # La tabla no existe todavía; usamos defaults
-        return _default_shifts()
-
-    if not rows:
-        return _default_shifts()
-
-    shifts = []
-    for row in rows:
-        if not row["activo"]:
-            continue
-        # hora_inicio es timedelta en mysql-connector
-        start_td = row["hora_inicio"]
-        end_td = row["hora_fin"]
-        shifts.append(Shift(
-            id=row["id"],
-            name=row["nombre"],
-            start_min=int(start_td.total_seconds() // 60),
-            end_min=int(end_td.total_seconds() // 60),
-            activo=True,
-        ))
-    return shifts
-
-
-def _default_shifts() -> list[Shift]:
-    """Turnos por defecto basados en el Excel del plan de producción."""
-    return [
-        Shift(id=1, name="Turno 1", start_min=6*60, end_min=14*60+30, activo=True),
-        Shift(id=2, name="Turno 2", start_min=11*60+30, end_min=22*60, activo=True),
-    ]
-
-
-# ══════════════════════════════════════════════════════════════════
-# PARTES Y SUS RUTAS
-# ══════════════════════════════════════════════════════════════════
-
-def load_parts(conn: Connection) -> dict[str, Part]:
-    """
-    Carga todos los números de parte activos con sus rutas y tiempos de ciclo.
-
-    Estrategia: 3 consultas separadas (partes, rutas, tiempos de ciclo)
-    y luego ensamblaje en Python. Más rápido que un JOIN enorme y
-    más fácil de mantener.
-
-    Por qué dict[str, Part]: el scheduler busca partes por part_number
-    constantemente. O(1) vs O(n) si fuera lista.
-    """
-    parts = _load_base_parts(conn)
-    _attach_route_steps(conn, parts)
-    _attach_cycle_times(conn, parts)
-    return parts
-
-
-def _load_base_parts(conn: Connection) -> dict[str, Part]:
-    """
-    Carga los atributos base de cada parte desde part_prod.
-    """
+def _load_parts(conn: Connection, only_active: bool) -> dict[str, Part]:
     sql = """
-        SELECT Part_No, Customer, Project, Workcenter, SPM_Plan, Man
+        SELECT Part_No, Customer, Project, Workcenter, SPM_Plan, peso_kg, activo
         FROM part_prod
     """
-    rows = _query(conn, sql)
+    params: tuple[Any, ...] = ()
+    if only_active:
+        sql += " WHERE activo = %s"
+        params = (1,)
+
+    rows = _query(conn, sql, params)
     parts: dict[str, Part] = {}
+
     for row in rows:
-        pn = row["Part_No"]
-        parts[pn] = Part(
-            part_number=pn,
-            customer=row["Customer"] or "",
-            project=row["Project"] or "",
-            workcenter=row["Workcenter"] or "",
-            spm_plan=float(row["SPM_Plan"] or 0),
-            man=int(row["Man"] or 1),
-            activo=True,
+        part_number = str(row["Part_No"])
+        parts[part_number] = Part(
+            part_number=part_number,
+            customer=str(row.get("Customer") or ""),
+            project=str(row.get("Project") or ""),
+            workcenter=str(row.get("Workcenter") or ""),
+            spm_plan=float(row["SPM_Plan"]) if row.get("SPM_Plan") is not None else 0.0,
+            weight_kg=float(row["peso_kg"]) if row.get("peso_kg") is not None else None,
+            active=bool(row.get("activo", True)),
         )
+
     return parts
 
 
-def _attach_route_steps(conn: Connection, parts: dict[str, Part]) -> None:
-    """
-    Añade los RouteStep a cada Part, incluyendo máquinas alternativas.
+def _load_routes(conn: Connection) -> tuple[dict[str, list[Route]], dict[int, Route]]:
+    route_rows = _query(
+        conn,
+        """
+        SELECT id, part_number, step_order, process_name, machine_id, setup_time_min
+        FROM rutas
+        ORDER BY part_number, step_order, id
+        """,
+    )
+    alt_rows = _query(
+        conn,
+        """
+        SELECT ruta_id, machine_id, es_preferida
+        FROM rutas_maquinas
+        """,
+    )
 
-    Ejecuta dos queries:
-    1. Pasos principales (tabla rutas)
-    2. Alternativas (tabla rutas_maquinas) agrupadas por ruta_id
+    alternatives_by_route: dict[int, list[int]] = {}
+    preferred_by_route: dict[int, list[int]] = {}
+    for row in alt_rows:
+        route_id = int(row["ruta_id"])
+        machine_id = int(row["machine_id"])
+        alternatives_by_route.setdefault(route_id, []).append(machine_id)
+        if bool(row.get("es_preferida", False)):
+            preferred_by_route.setdefault(route_id, []).append(machine_id)
 
-    Decisión: mutar `parts` in-place en lugar de retornar una copia.
-    Es eficiente en memoria y el llamador ya sabe que la función modifica.
-    """
-    # -- Paso 1: rutas principales --
-    try:
-        route_rows = _query(conn, """
-            SELECT id, part_number, step_order, process_name, machine_id, setup_time_min
-            FROM rutas
-            ORDER BY part_number, step_order
-        """)
-    except mysql.connector.Error:
-        return  # tabla vacía o inexistente
-
-    # -- Paso 2: máquinas alternativas --
-    alt_map: dict[int, list[int]] = {}  # ruta_id → [machine_id, ...]
-    try:
-        alt_rows = _query(conn, "SELECT ruta_id, machine_id FROM rutas_maquinas")
-        for row in alt_rows:
-            alt_map.setdefault(row["ruta_id"], []).append(row["machine_id"])
-    except mysql.connector.Error:
-        pass  # tabla opcional
-
-    # -- Ensamblaje --
+    routes_by_part: dict[str, list[Route]] = {}
+    routes_by_id: dict[int, Route] = {}
     for row in route_rows:
-        pn = row["part_number"]
-        if pn not in parts:
-            continue  # ruta huérfana; se ignora
-
-        step = RouteStep(
-            id=row["id"],
-            part_number=pn,
-            step_order=row["step_order"],
-            process_name=row["process_name"],
-            machine_id=row["machine_id"],
-            setup_time_min=row["setup_time_min"],
-            alt_machine_ids=alt_map.get(row["id"], []),
+        route_id = int(row["id"])
+        route = Route(
+            id=route_id,
+            part_number=str(row["part_number"]),
+            step_order=int(row["step_order"]),
+            process_name=str(row.get("process_name") or ""),
+            machine_id=int(row["machine_id"]),
+            setup_time_min=int(row.get("setup_time_min") or 0),
+            alternative_machine_ids=alternatives_by_route.get(route_id, []),
+            preferred_machine_ids=preferred_by_route.get(route_id, []),
         )
-        parts[pn].route_steps.append(step)
+        routes_by_part.setdefault(route.part_number, []).append(route)
+        routes_by_id[route_id] = route
+
+    return routes_by_part, routes_by_id
 
 
-def _attach_cycle_times(conn: Connection, parts: dict[str, Part]) -> None:
-    """
-    Añade los CycleTime a cada Part.
+def _load_cycle_times(conn: Connection) -> dict[tuple[str, int], CycleTime]:
+    rows = _query(
+        conn,
+        """
+        SELECT part_number, machine_id, cycle_time_min
+        FROM tiempos_ciclo
+        """,
+    )
 
-    Si la tabla tiempos_ciclo está vacía, se estiman los tiempos
-    a partir de SPM_Plan de part_prod:
-        cycle_time_min = 1 / SPM_Plan
-    Esto es un fallback; el dato real siempre debe venir de la BD.
-    """
-    try:
-        ct_rows = _query(conn, """
-            SELECT part_number, machine_id, cycle_time_min
-            FROM tiempos_ciclo
-        """)
-    except mysql.connector.Error:
-        ct_rows = []
-
-    if ct_rows:
-        for row in ct_rows:
-            pn = row["part_number"]
-            if pn not in parts:
-                continue
-            ct = CycleTime(
-                part_number=pn,
-                machine_id=row["machine_id"],
-                cycle_time_min=float(row["cycle_time_min"]),
-            )
-            parts[pn].cycle_times[row["machine_id"]] = ct
-    else:
-        # Fallback: estimar desde SPM_Plan
-        for pn, part in parts.items():
-            if part.spm_plan and part.spm_plan > 0:
-                cycle_min = 1.0 / part.spm_plan
-                # Asignar a la máquina del workcenter (no tenemos machine_id directo)
-                # Usamos machine_id = 0 como placeholder
-                parts[pn].cycle_times[0] = CycleTime(
-                    part_number=pn,
-                    machine_id=0,
-                    cycle_time_min=cycle_min,
-                )
-
-
-# ══════════════════════════════════════════════════════════════════
-# ÓRDENES DE PRODUCCIÓN
-# ══════════════════════════════════════════════════════════════════
-
-def load_orders(conn: Connection, status: str = "pending") -> list[Order]:
-    """
-    Carga las órdenes de producción pendientes.
-
-    Filtra por status para no incluir órdenes ya completadas.
-    El solver solo necesita saber qué falta producir.
-
-    Ordenadas por prioridad ASC (1 = alta primero) y due_date ASC
-    para que el solver las vea en el orden más razonable.
-    """
-    try:
-        rows = _query(conn, """
-            SELECT id, part_number, cliente, quantity, due_date, priority, status
-            FROM ordenes
-            WHERE status = %s
-            ORDER BY priority ASC, due_date ASC
-        """, (status,))
-    except mysql.connector.Error:
-        return []
-
-    orders = []
+    cycle_times: dict[tuple[str, int], CycleTime] = {}
     for row in rows:
-        orders.append(Order(
-            id=row["id"],
-            part_number=row["part_number"],
-            cliente=row["cliente"] or "",
-            quantity=row["quantity"],
-            due_date=row["due_date"],
-            priority=row["priority"],
-            status=row["status"],
-        ))
+        part_number = str(row["part_number"])
+        machine_id = int(row["machine_id"])
+        key = (part_number, machine_id)
+        cycle_times[key] = CycleTime(
+            part_number=part_number,
+            machine_id=machine_id,
+            cycle_time_min=float(row["cycle_time_min"]),
+        )
+
+    return cycle_times
+
+
+def _load_orders(conn: Connection, order_status: str) -> list[Order]:
+    rows = _query(
+        conn,
+        """
+        SELECT id, part_number, cliente, quantity, due_date, priority, status
+        FROM ordenes
+        WHERE status = %s
+        ORDER BY priority ASC, due_date ASC, id ASC
+        """,
+        (order_status,),
+    )
+
+    orders: list[Order] = []
+    for row in rows:
+        orders.append(
+            Order(
+                id=int(row["id"]),
+                part_number=str(row["part_number"]),
+                customer=str(row.get("cliente") or ""),
+                quantity=int(row["quantity"]),
+                due_date=_to_date(row["due_date"], "ordenes.due_date"),
+                priority=int(row.get("priority") or 0),
+                status=str(row.get("status") or ""),
+            )
+        )
+
     return orders
 
 
-# ══════════════════════════════════════════════════════════════════
-# FUNCIÓN PRINCIPAL — Carga todo de una vez
-# ══════════════════════════════════════════════════════════════════
-
-def load_all_data(conn: Connection) -> dict:
+def _load_shifts(conn: Connection, only_active: bool) -> list[Shift]:
+    sql = """
+        SELECT id, nombre, hora_inicio, hora_fin, activo
+        FROM turnos
     """
-    Carga el estado completo de la planta en una sola llamada.
+    params: tuple[Any, ...] = ()
+    if only_active:
+        sql += " WHERE activo = %s"
+        params = (1,)
+    sql += " ORDER BY id"
 
-    Retorna un dict con claves estandarizadas que el scheduler.py
-    consume directamente. Separarlos así permite:
-    - Caché independiente por sección (e.g. las máquinas cambian poco)
-    - Testing de cada sección por separado
-    - La API puede serializar solo la sección que necesita
+    rows = _query(conn, sql, params)
 
-    Retorno:
-    {
-        "machines": dict[int, Machine],
-        "shifts":   list[Shift],
-        "parts":    dict[str, Part],
-        "orders":   list[Order],
-    }
-    """
-    return {
-        "machines": load_machines(conn),
-        "shifts":   load_shifts(conn),
-        "parts":    load_parts(conn),
-        "orders":   load_orders(conn),
-    }
+    shifts: list[Shift] = []
+    for row in rows:
+        start_min = _to_minutes(row["hora_inicio"], "turnos.hora_inicio")
+        end_min = _to_minutes(row["hora_fin"], "turnos.hora_fin")
+        if end_min <= start_min:
+            raise RepositoryDataError(
+                f"Shift crosses midnight or is invalid: shift_id={row['id']}, start={start_min}, end={end_min}"
+            )
+
+        shifts.append(
+            Shift(
+                id=int(row["id"]),
+                name=str(row.get("nombre") or ""),
+                start_min=start_min,
+                end_min=end_min,
+                active=bool(row.get("activo", True)),
+            )
+        )
+
+    return shifts
 
 
-# ══════════════════════════════════════════════════════════════════
-# ESCRITURA — Guardar el plan generado
-# ══════════════════════════════════════════════════════════════════
+def _validate_integrity(
+    *,
+    machines: dict[int, Machine],
+    parts: dict[str, Part],
+    routes_by_part: dict[str, list[Route]],
+    cycle_times: dict[tuple[str, int], CycleTime],
+    orders: list[Order],
+) -> None:
+    for order in orders:
+        if order.part_number not in parts:
+            raise RepositoryDataError(
+                f"Order {order.id} references missing part_number '{order.part_number}'."
+            )
 
-def save_plan(conn: Connection, result_dict: dict) -> int:
-    """
-    Guarda el resultado del solver en `planes_generados`.
+    for part_number, routes in routes_by_part.items():
+        for route in routes:
+            for machine_id in route.eligible_machine_ids:
+                if machine_id not in machines:
+                    raise RepositoryDataError(
+                        f"Route {route.id} references unknown machine_id {machine_id}."
+                    )
+                if (part_number, machine_id) not in cycle_times:
+                    raise RepositoryDataError(
+                        f"Missing cycle time for part '{part_number}' on machine_id {machine_id}."
+                    )
 
-    result_dict debe tener las claves:
-      - solver_status: str
-      - makespan_min:  int
-      - horizon_dias:  int
-      - gantt_json:    str (JSON serializado)
+    part_numbers_with_orders = {order.part_number for order in orders}
+    for part_number in part_numbers_with_orders:
+        if not routes_by_part.get(part_number):
+            raise RepositoryDataError(
+                f"Part '{part_number}' has orders but no routes defined in rutas."
+            )
 
-    Retorna el id del plan insertado.
-    """
-    import json
 
-    cursor = conn.cursor()
-    try:
-        cursor.execute("""
-            INSERT INTO planes_generados
-                (status, solver_status, makespan_min, horizonte_dias, gantt_json)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            "completed",
-            result_dict["solver_status"],
-            result_dict["makespan_min"],
-            result_dict["horizon_dias"],
-            json.dumps(result_dict["gantt_json"], ensure_ascii=False),
-        ))
-        conn.commit()
-        return cursor.lastrowid
-    finally:
-        cursor.close()
+def load_planning_data(
+    conn: Connection,
+    *,
+    order_status: str = "pending",
+    only_active: bool = True,
+) -> PlanningData:
+    """Load all scheduler input data from MySQL into domain dataclasses."""
+    machines = _load_machines(conn, only_active=only_active)
+    parts = _load_parts(conn, only_active=only_active)
+    routes_by_part, _routes_by_id = _load_routes(conn)
+    cycle_times = _load_cycle_times(conn)
+    orders = _load_orders(conn, order_status=order_status)
+    shifts = _load_shifts(conn, only_active=only_active)
+
+    _validate_integrity(
+        machines=machines,
+        parts=parts,
+        routes_by_part=routes_by_part,
+        cycle_times=cycle_times,
+        orders=orders,
+    )
+
+    return PlanningData(
+        machines=machines,
+        parts=parts,
+        routes_by_part=routes_by_part,
+        cycle_times=cycle_times,
+        orders=orders,
+        shifts=shifts,
+    )
+
