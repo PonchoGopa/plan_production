@@ -5,7 +5,7 @@ Capa de orquestación: único punto de contacto entre el API (Flask) y el motor
 de planificación (repository + scheduler).
 
 Responsabilidades:
-  1. Abrir / cerrar la conexión a MySQL.
+  1. Abrir / cerrar la conexión a MySQL usando AppConfig.
   2. Llamar a repository para obtener órdenes, rutas y máquinas.
   3. Construir el horizonte de planificación a partir de los parámetros del turno.
   4. Invocar al scheduler y recibir el resultado.
@@ -18,14 +18,13 @@ Restricción clave: este archivo NO importa Flask en ningún punto.
 from __future__ import annotations
 
 import logging
-from dataclasses import asdict
 from datetime import date, datetime, time, timedelta
 from typing import Any
 
 import mysql.connector
 from mysql.connector import MySQLConnection
 
-from . import config
+from config import from_env           # config.py en la raíz del proyecto
 from . import repository
 from . import scheduler as sched
 
@@ -33,16 +32,13 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constantes de turno
-# Dos turnos con solapamiento de ~3 horas.  Los valores se pueden sobreescribir
-# pasando shift_start / shift_end explícitos al llamar a run_schedule().
 # ---------------------------------------------------------------------------
 SHIFTS: dict[str, tuple[time, time]] = {
-    "T1": (time(6, 0),  time(14, 30)),   # Turno 1: 06:00 – 14:30
-    "T2": (time(11, 30), time(22, 0)),   # Turno 2: 11:30 – 22:00
-    "ALL": (time(6, 0),  time(22, 0)),   # Día completo (ambos turnos)
+    "T1":  (time(6,  0),  time(14, 30)),   # Turno 1: 06:00 – 14:30
+    "T2":  (time(11, 30), time(22,  0)),   # Turno 2: 11:30 – 22:00
+    "ALL": (time(6,  0),  time(22,  0)),   # Día completo (ambos turnos)
 }
 
-# Días de anticipación mínimos para tener una semana de stock lista
 MIN_STOCK_DAYS = 7
 
 
@@ -52,18 +48,12 @@ MIN_STOCK_DAYS = 7
 
 def _get_connection() -> MySQLConnection:
     """
-    Crea y devuelve una conexión MySQL usando los parámetros de config.py.
-    La conexión se devuelve SIN autocommit para que el llamador controle
-    explícitamente commit / rollback.
+    Crea una conexión MySQL usando AppConfig.db.as_connector_kwargs().
+    autocommit queda en False (valor por defecto en DBConfig) para que el
+    llamador controle explícitamente commit / rollback.
     """
-    return mysql.connector.connect(
-        host=config.DB_HOST,
-        port=config.DB_PORT,
-        user=config.DB_USER,
-        password=config.DB_PASSWORD,
-        database=config.DB_NAME,
-        autocommit=False,
-    )
+    cfg = from_env()
+    return mysql.connector.connect(**cfg.db.as_connector_kwargs())
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +85,7 @@ def run_schedule(
         status      : "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "ERROR"
         plan_date   : fecha planificada (ISO string)
         horizon_min : duración del horizonte en minutos
-        tasks       : lista de tareas asignadas (ver _format_tasks)
+        tasks       : lista de tareas asignadas
         makespan_min: duración total del plan en minutos
         message     : texto descriptivo del resultado
     """
@@ -138,12 +128,16 @@ def run_schedule(
             len(orders), len(routes), len(machines),
         )
 
-        # ── 3. Llamar al scheduler ─────────────────────────────────────────
+        # ── 3. Pasar configuración del solver desde AppConfig ──────────────
+        cfg = from_env()
         result = sched.solve(
             orders=orders,
             routes=routes,
             machines=machines,
             horizon_minutes=horizon_min,
+            time_limit_seconds=cfg.solver.time_limit_seconds,
+            num_workers=cfg.solver.num_workers,
+            random_seed=cfg.solver.random_seed,
         )
 
         # ── 4. Persistir si se solicitó ────────────────────────────────────
@@ -177,12 +171,6 @@ def run_schedule(
 def get_stock_status(reference_date: date | None = None) -> dict[str, Any]:
     """
     Devuelve el estado de stock actual comparado con el objetivo de una semana.
-
-    Para cada número de parte en production_plan verifica cuántas unidades
-    se producirán en los próximos MIN_STOCK_DAYS días y marca si se cumple
-    o no el objetivo semanal.
-
-    Esta información sirve al API para mostrar alertas en el dashboard.
     """
     reference_date = reference_date or date.today()
     deadline = reference_date + timedelta(days=MIN_STOCK_DAYS)
@@ -199,7 +187,6 @@ def get_stock_status(reference_date: date | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _time_diff_minutes(start: time, end: time) -> int:
-    """Diferencia en minutos entre dos objetos time del mismo día."""
     dummy = date(2000, 1, 1)
     dt_start = datetime.combine(dummy, start)
     dt_end   = datetime.combine(dummy, end)
@@ -224,11 +211,10 @@ def _format_result(
     shift_start: time,
 ) -> dict[str, Any]:
     """
-    Transforma la salida interna del scheduler en un dict serializable
-    apto para JSON.  Convierte los offsets de minutos en horas reales del
-    día (shift_start + offset).
+    Convierte los offsets de minutos internos del solver en horas reales del día.
+    Ejemplo: shift_start=06:00, offset=120 → start_time="08:00"
     """
-    dummy = date(2000, 1, 1)
+    dummy   = date(2000, 1, 1)
     dt_base = datetime.combine(dummy, shift_start)
 
     formatted_tasks = []
@@ -236,15 +222,15 @@ def _format_result(
         start_dt = dt_base + timedelta(minutes=task["start_min"])
         end_dt   = dt_base + timedelta(minutes=task["end_min"])
         formatted_tasks.append({
-            "order_id":    task["order_id"],
-            "part_number": task["part_number"],
-            "step_order":  task["step_order"],
-            "process":     task["process"],
-            "machine":     task["machine"],
-            "start_time":  start_dt.strftime("%H:%M"),
-            "end_time":    end_dt.strftime("%H:%M"),
+            "order_id":     task["order_id"],
+            "part_number":  task["part_number"],
+            "step_order":   task["step_order"],
+            "process":      task["process"],
+            "machine":      task["machine"],
+            "start_time":   start_dt.strftime("%H:%M"),
+            "end_time":     end_dt.strftime("%H:%M"),
             "duration_min": task["end_min"] - task["start_min"],
-            "is_late":     task.get("is_late", False),
+            "is_late":      task.get("is_late", False),
         })
 
     makespan = max((t["end_min"] for t in raw.get("tasks", [])), default=0)
@@ -276,15 +262,13 @@ def _save_production_plan(
     tasks: list[dict[str, Any]],
 ) -> None:
     """
-    Persiste las tareas del plan en la tabla production_plan.
-    Borra primero las filas del mismo día para que sea idempotente
-    (ejecutar dos veces no duplica datos).
+    Persiste las tareas en production_plan.
+    Borra primero el día para que sea idempotente (re-ejecutar no duplica).
     """
-    cursor = conn.cursor()
-    dummy  = date(2000, 1, 1)
+    cursor  = conn.cursor()
+    dummy   = date(2000, 1, 1)
     dt_base = datetime.combine(dummy, shift_start)
 
-    # Limpiar el día antes de insertar
     cursor.execute(
         "DELETE FROM production_plan WHERE Date = %s",
         (plan_date.isoformat(),)
@@ -295,8 +279,7 @@ def _save_production_plan(
             (Date, Machine, Part_No, Operation_Code, Quantity,
              Start_Time, End_Time, Duration_Min, Position, Stop_Program,
              SPM, PPM, Hours, Total_Hours)
-        VALUES
-            (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
 
     rows = []
@@ -305,21 +288,22 @@ def _save_production_plan(
         end_dt   = dt_base + timedelta(minutes=task["end_min"])
         dur_min  = task["end_min"] - task["start_min"]
         hours    = round(dur_min / 60, 4)
+
         rows.append((
-            plan_date.isoformat(),          # Date
-            task["machine"],                # Machine
-            task["part_number"],            # Part_No
-            task.get("process", ""),        # Operation_Code
-            task.get("quantity", 0),        # Quantity
-            start_dt.strftime("%H:%M:%S"),  # Start_Time
-            end_dt.strftime("%H:%M:%S"),    # End_Time
-            dur_min,                        # Duration_Min
-            pos,                            # Position
-            0,                             # Stop_Program
-            task.get("spm", 0),             # SPM
-            task.get("ppm", 0),             # PPM
-            hours,                          # Hours
-            hours,                          # Total_Hours
+            plan_date.isoformat(),
+            task["machine"],
+            task["part_number"],
+            task.get("process", ""),
+            task.get("quantity", 0),
+            start_dt.strftime("%H:%M:%S"),
+            end_dt.strftime("%H:%M:%S"),
+            dur_min,
+            pos,
+            0,
+            task.get("spm", 0),
+            task.get("ppm", 0),
+            hours,
+            hours,
         ))
 
     cursor.executemany(insert_sql, rows)

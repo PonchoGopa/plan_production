@@ -1,5 +1,18 @@
-ortools>=9.8
-mysql-connector-python>=8.3
-Flask>=3.0
-python-dotenv>=1.0
+# Kimex Job Shop Scheduler — dependencias
+# Instalar con: pip install -r requirements.txt
 
+# API
+flask==3.0.3
+flask-cors==4.0.1
+
+# Base de datos
+mysql-connector-python==8.4.0
+
+# Solver
+ortools==9.10.4067
+
+# Variables de entorno
+python-dotenv==1.0.1
+
+# Servidor de producción (opcional en desarrollo)
+gunicorn==22.0.0
