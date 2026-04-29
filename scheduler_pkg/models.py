@@ -18,6 +18,23 @@ class Machine:
     tonnage_ton: float | None
     active: bool
 
+    # Alias para compatibilidad con scheduler.py que usa .activa
+    @property
+    def activa(self) -> bool:
+        return self.active
+
+    # Alias para compatibilidad con scheduler.py que usa .proceso
+    @property
+    def proceso(self) -> str:
+        return self.process_name
+
+
+@dataclass(frozen=True)
+class CycleTime:
+    part_number: str
+    machine_id: int
+    cycle_time_min: float
+
 
 @dataclass(frozen=True)
 class Route:
@@ -40,6 +57,21 @@ class Route:
                 deduplicated.append(machine_id)
                 seen.add(machine_id)
         return deduplicated
+
+    # Aliases para compatibilidad con scheduler.py que usa RouteStep
+    @property
+    def eligible_machines(self) -> list[int]:
+        """Alias de eligible_machine_ids — usado por scheduler.py."""
+        return self.eligible_machine_ids
+
+    @property
+    def alt_machine_ids(self) -> list[int]:
+        """Alias de alternative_machine_ids — usado por scheduler.py."""
+        return self.alternative_machine_ids
+
+
+# Alias para compatibilidad: scheduler.py importa RouteStep, el resto usa Route
+RouteStep = Route
 
 
 @dataclass(frozen=True)
@@ -65,12 +97,10 @@ class Shift:
     def duration_min(self) -> int:
         return self.end_min - self.start_min
 
-
-@dataclass(frozen=True)
-class CycleTime:
-    part_number: str
-    machine_id: int
-    cycle_time_min: float
+    # Alias para compatibilidad con scheduler.py que usa .activo
+    @property
+    def activo(self) -> bool:
+        return self.active
 
 
 @dataclass(frozen=True)
@@ -82,6 +112,10 @@ class Part:
     spm_plan: float
     weight_kg: float | None
     active: bool
+    # Rutas y tiempos de ciclo precargados (opcionales)
+    # Se usan en scheduler.py para calcular duración de tareas
+    route_steps: list[Route] = field(default_factory=list)
+    cycle_times: dict[int, CycleTime] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,6 +129,7 @@ class ScheduledTask:
     start_min: int
     end_min: int
     quantity: int
+    machine_name: str = ""      # Nombre legible de la máquina — llenado por scheduler
 
     @property
     def duration_min(self) -> int:
@@ -122,4 +157,3 @@ class PlanningData:
     cycle_times: dict[tuple[str, int], CycleTime]
     orders: list[Order]
     shifts: list[Shift]
-

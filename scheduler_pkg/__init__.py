@@ -12,8 +12,6 @@ from .models import (
     Shift,
 )
 from .repository import RepositoryDataError, load_planning_data
-from .scheduler import JobShopScheduler, SolverOptions
-from .service import PlanningService
 
 __all__ = [
     "CycleTime",
@@ -26,9 +24,5 @@ __all__ = [
     "ScheduledTask",
     "ScheduleResult",
     "Shift",
-    "SolverOptions",
-    "JobShopScheduler",
-    "PlanningService",
     "load_planning_data",
 ]
-

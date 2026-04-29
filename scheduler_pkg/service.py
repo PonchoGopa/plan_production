@@ -6,9 +6,9 @@ de planificación (repository + scheduler).
 
 Responsabilidades:
   1. Abrir / cerrar la conexión a MySQL usando AppConfig.
-  2. Llamar a repository para obtener órdenes, rutas y máquinas.
-  3. Construir el horizonte de planificación a partir de los parámetros del turno.
-  4. Invocar al scheduler y recibir el resultado.
+  2. Llamar a load_planning_data() para obtener todo de una vez.
+  3. Construir SolverConfig desde AppConfig.
+  4. Invocar al scheduler y recibir el ScheduleResult.
   5. Opcionalmente persistir el plan en production_plan.
   6. Devolver un dict limpio al API (sin objetos internos).
 
@@ -24,40 +24,33 @@ from typing import Any
 import mysql.connector
 from mysql.connector import MySQLConnection
 
-from config import from_env           # config.py en la raíz del proyecto
-from . import repository
-from . import scheduler as sched
+from config import from_env                          # config.py raíz
+from .repository import load_planning_data, RepositoryDataError, get_stock_summary
+from .scheduler import solve
+from .config import SolverConfig                     # scheduler_pkg/config.py
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constantes de turno
-# ---------------------------------------------------------------------------
 SHIFTS: dict[str, tuple[time, time]] = {
-    "T1":  (time(6,  0),  time(14, 30)),   # Turno 1: 06:00 – 14:30
-    "T2":  (time(11, 30), time(22,  0)),   # Turno 2: 11:30 – 22:00
-    "ALL": (time(6,  0),  time(22,  0)),   # Día completo (ambos turnos)
+    "T1":  (time(6,  0),  time(14, 30)),
+    "T2":  (time(11, 30), time(22,  0)),
+    "ALL": (time(6,  0),  time(22,  0)),
 }
 
 MIN_STOCK_DAYS = 7
 
 
 # ---------------------------------------------------------------------------
-# Conexión a la base de datos
+# Conexión
 # ---------------------------------------------------------------------------
 
 def _get_connection() -> MySQLConnection:
-    """
-    Crea una conexión MySQL usando AppConfig.db.as_connector_kwargs().
-    autocommit queda en False (valor por defecto en DBConfig) para que el
-    llamador controle explícitamente commit / rollback.
-    """
     cfg = from_env()
     return mysql.connector.connect(**cfg.db.as_connector_kwargs())
 
 
 # ---------------------------------------------------------------------------
-# Función principal: run_schedule()
+# run_schedule()
 # ---------------------------------------------------------------------------
 
 def run_schedule(
@@ -69,115 +62,95 @@ def run_schedule(
 ) -> dict[str, Any]:
     """
     Ejecuta el planificador completo para una fecha y turno dados.
-
-    Parámetros
-    ----------
-    plan_date   : Fecha a planificar. Si None, usa hoy.
-    shift       : Clave de SHIFTS ("T1", "T2", "ALL"). Ignorado si se pasan
-                  shift_start / shift_end explícitos.
-    shift_start : Hora de inicio del turno (sobreescribe `shift`).
-    shift_end   : Hora de fin del turno (sobreescribe `shift`).
-    save_plan   : Si True, persiste el resultado en la tabla production_plan.
-
-    Devuelve
-    --------
-    dict con las claves:
-        status      : "OPTIMAL" | "FEASIBLE" | "INFEASIBLE" | "ERROR"
-        plan_date   : fecha planificada (ISO string)
-        horizon_min : duración del horizonte en minutos
-        tasks       : lista de tareas asignadas
-        makespan_min: duración total del plan en minutos
-        message     : texto descriptivo del resultado
+    Devuelve un dict serializable a JSON.
     """
     plan_date = plan_date or date.today()
 
-    # ── 1. Resolver horizonte de tiempo ────────────────────────────────────
+    # ── Horizonte de tiempo ────────────────────────────────────────────────
     if shift_start and shift_end:
         t_start, t_end = shift_start, shift_end
     else:
         if shift not in SHIFTS:
-            raise ValueError(
-                f"Turno '{shift}' no válido. Opciones: {list(SHIFTS.keys())}"
-            )
+            raise ValueError(f"Turno '{shift}' no válido. Opciones: {list(SHIFTS.keys())}")
         t_start, t_end = SHIFTS[shift]
 
     horizon_min = _time_diff_minutes(t_start, t_end)
     if horizon_min <= 0:
-        raise ValueError(
-            f"shift_end ({t_end}) debe ser posterior a shift_start ({t_start})."
-        )
+        raise ValueError(f"shift_end debe ser posterior a shift_start.")
 
-    logger.info(
-        "run_schedule | fecha=%s turno=%s inicio=%s fin=%s horizonte=%d min",
-        plan_date, shift, t_start, t_end, horizon_min,
-    )
+    logger.info("run_schedule | fecha=%s turno=%s horizonte=%d min", plan_date, shift, horizon_min)
 
-    # ── 2. Conectar a la BD e invocar repositorio ──────────────────────────
     conn = _get_connection()
     try:
-        orders   = repository.get_open_orders(conn, plan_date)
-        routes   = repository.get_all_routes(conn)
-        machines = repository.get_machines(conn)
+        # ── Cargar todos los datos de una vez ──────────────────────────────
+        planning_data = load_planning_data(conn, plan_date)
 
-        if not orders:
-            logger.warning("No hay órdenes abiertas para %s.", plan_date)
+        if not planning_data.orders:
             return _empty_result(plan_date, horizon_min, "No hay órdenes abiertas.")
 
         logger.info(
-            "Datos cargados: %d órdenes · %d rutas · %d máquinas",
-            len(orders), len(routes), len(machines),
+            "Datos cargados: %d órdenes · %d máquinas · %d partes",
+            len(planning_data.orders),
+            len(planning_data.machines),
+            len(planning_data.parts),
         )
 
-        # ── 3. Pasar configuración del solver desde AppConfig ──────────────
-        cfg = from_env()
-        result = sched.solve(
-            orders=orders,
-            routes=routes,
-            machines=machines,
+        # ── Construir SolverConfig desde AppConfig ─────────────────────────
+        app_cfg    = from_env()
+        solver_cfg = SolverConfig.from_app_config(app_cfg.solver)
+        # El horizonte del turno sobreescribe el del config — el plan es diario
+        solver_cfg = SolverConfig(
+            time_limit_seconds=solver_cfg.time_limit_seconds,
+            num_workers=solver_cfg.num_workers,
+            random_seed=solver_cfg.random_seed,
             horizon_minutes=horizon_min,
-            time_limit_seconds=cfg.solver.time_limit_seconds,
-            num_workers=cfg.solver.num_workers,
-            random_seed=cfg.solver.random_seed,
+            minutes_per_slot=solver_cfg.minutes_per_slot,
         )
 
-        # ── 4. Persistir si se solicitó ────────────────────────────────────
-        if save_plan and result["status"] in ("OPTIMAL", "FEASIBLE"):
-            _save_production_plan(conn, plan_date, t_start, result["tasks"])
+        # ── Resolver ───────────────────────────────────────────────────────
+        result = solve(
+            orders=planning_data.orders,
+            parts=planning_data.parts,
+            machines=planning_data.machines,
+            shifts=planning_data.shifts,
+            solver_config=solver_cfg,
+        )
+
+        # ── Persistir si se solicitó ───────────────────────────────────────
+        if save_plan and result.is_feasible:
+            _save_production_plan(conn, plan_date, t_start, result)
             conn.commit()
             logger.info("Plan persistido en production_plan.")
 
-        # ── 5. Formatear y devolver ────────────────────────────────────────
         return _format_result(result, plan_date, horizon_min, t_start)
+
+    except RepositoryDataError as exc:
+        conn.rollback()
+        logger.error("Error de datos: %s", exc)
+        return _empty_result(plan_date, horizon_min, str(exc))
 
     except Exception as exc:
         conn.rollback()
-        logger.exception("Error en run_schedule: %s", exc)
+        logger.exception("Error inesperado en run_schedule: %s", exc)
         return {
-            "status":       "ERROR",
-            "plan_date":    plan_date.isoformat(),
-            "horizon_min":  horizon_min,
-            "tasks":        [],
-            "makespan_min": 0,
-            "message":      f"Error interno: {exc}",
+            "status": "ERROR", "plan_date": plan_date.isoformat(),
+            "horizon_min": horizon_min, "tasks": [],
+            "makespan_min": 0, "message": f"Error interno: {exc}",
         }
     finally:
         conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Función auxiliar: get_stock_status()
+# get_stock_status()
 # ---------------------------------------------------------------------------
 
 def get_stock_status(reference_date: date | None = None) -> dict[str, Any]:
-    """
-    Devuelve el estado de stock actual comparado con el objetivo de una semana.
-    """
     reference_date = reference_date or date.today()
     deadline = reference_date + timedelta(days=MIN_STOCK_DAYS)
-
     conn = _get_connection()
     try:
-        return repository.get_stock_summary(conn, reference_date, deadline)
+        return get_stock_summary(conn, reference_date, deadline)
     finally:
         conn.close()
 
@@ -188,91 +161,69 @@ def get_stock_status(reference_date: date | None = None) -> dict[str, Any]:
 
 def _time_diff_minutes(start: time, end: time) -> int:
     dummy = date(2000, 1, 1)
-    dt_start = datetime.combine(dummy, start)
-    dt_end   = datetime.combine(dummy, end)
-    return int((dt_end - dt_start).total_seconds() // 60)
+    return int((datetime.combine(dummy, end) - datetime.combine(dummy, start)).total_seconds() // 60)
 
 
 def _empty_result(plan_date: date, horizon_min: int, message: str) -> dict[str, Any]:
     return {
-        "status":       "INFEASIBLE",
-        "plan_date":    plan_date.isoformat(),
-        "horizon_min":  horizon_min,
-        "tasks":        [],
-        "makespan_min": 0,
-        "message":      message,
+        "status": "INFEASIBLE", "plan_date": plan_date.isoformat(),
+        "horizon_min": horizon_min, "tasks": [],
+        "makespan_min": 0, "message": message,
     }
 
 
-def _format_result(
-    raw: dict[str, Any],
-    plan_date: date,
-    horizon_min: int,
-    shift_start: time,
-) -> dict[str, Any]:
-    """
-    Convierte los offsets de minutos internos del solver en horas reales del día.
-    Ejemplo: shift_start=06:00, offset=120 → start_time="08:00"
-    """
+def _format_result(result, plan_date: date, horizon_min: int, shift_start: time) -> dict[str, Any]:
+    """Convierte ScheduleResult a dict serializable con horas reales del día."""
     dummy   = date(2000, 1, 1)
     dt_base = datetime.combine(dummy, shift_start)
 
-    formatted_tasks = []
-    for task in raw.get("tasks", []):
-        start_dt = dt_base + timedelta(minutes=task["start_min"])
-        end_dt   = dt_base + timedelta(minutes=task["end_min"])
-        formatted_tasks.append({
-            "order_id":     task["order_id"],
-            "part_number":  task["part_number"],
-            "step_order":   task["step_order"],
-            "process":      task["process"],
-            "machine":      task["machine"],
+    tasks = []
+    for task in result.tasks:
+        start_dt = dt_base + timedelta(minutes=task.start_min)
+        end_dt   = dt_base + timedelta(minutes=task.end_min)
+        tasks.append({
+            "order_id":     task.order_id,
+            "part_number":  task.part_number,
+            "step_order":   task.step_order,
+            "process":      task.process_name,
+            "machine_id":   task.machine_id,
             "start_time":   start_dt.strftime("%H:%M"),
             "end_time":     end_dt.strftime("%H:%M"),
-            "duration_min": task["end_min"] - task["start_min"],
-            "is_late":      task.get("is_late", False),
+            "duration_min": task.duration_min,
+            "quantity":     task.quantity,
         })
 
-    makespan = max((t["end_min"] for t in raw.get("tasks", [])), default=0)
-
-    return {
-        "status":       raw["status"],
-        "plan_date":    plan_date.isoformat(),
-        "horizon_min":  horizon_min,
-        "tasks":        formatted_tasks,
-        "makespan_min": makespan,
-        "message":      _status_message(raw["status"], len(formatted_tasks)),
-    }
-
-
-def _status_message(status: str, n_tasks: int) -> str:
     messages = {
-        "OPTIMAL":    f"Plan óptimo generado con {n_tasks} tareas.",
-        "FEASIBLE":   f"Plan factible generado con {n_tasks} tareas (no garantizado óptimo).",
-        "INFEASIBLE": "No se encontró un plan factible con las restricciones actuales.",
+        "OPTIMAL":    f"Plan óptimo generado con {len(tasks)} tareas.",
+        "FEASIBLE":   f"Plan factible generado con {len(tasks)} tareas.",
+        "INFEASIBLE": "No se encontró un plan factible.",
         "UNKNOWN":    "El solver no pudo determinar una solución en el tiempo límite.",
     }
-    return messages.get(status, f"Estado desconocido: {status}")
+
+    return {
+        "status":                result.solver_status,
+        "plan_date":             plan_date.isoformat(),
+        "horizon_min":           horizon_min,
+        "tasks":                 tasks,
+        "makespan_min":          result.makespan_min,
+        "unscheduled_order_ids": result.unscheduled_order_ids,
+        "wall_time_seconds":     result.wall_time_seconds,
+        "message":               messages.get(result.solver_status, result.solver_status),
+    }
 
 
 def _save_production_plan(
     conn: MySQLConnection,
     plan_date: date,
     shift_start: time,
-    tasks: list[dict[str, Any]],
+    result,
 ) -> None:
-    """
-    Persiste las tareas en production_plan.
-    Borra primero el día para que sea idempotente (re-ejecutar no duplica).
-    """
+    """Persiste ScheduleResult en production_plan. Idempotente (borra antes de insertar)."""
     cursor  = conn.cursor()
     dummy   = date(2000, 1, 1)
     dt_base = datetime.combine(dummy, shift_start)
 
-    cursor.execute(
-        "DELETE FROM production_plan WHERE Date = %s",
-        (plan_date.isoformat(),)
-    )
+    cursor.execute("DELETE FROM production_plan WHERE Date = %s", (plan_date.isoformat(),))
 
     insert_sql = """
         INSERT INTO production_plan
@@ -281,29 +232,17 @@ def _save_production_plan(
              SPM, PPM, Hours, Total_Hours)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
-
     rows = []
-    for pos, task in enumerate(tasks, start=1):
-        start_dt = dt_base + timedelta(minutes=task["start_min"])
-        end_dt   = dt_base + timedelta(minutes=task["end_min"])
-        dur_min  = task["end_min"] - task["start_min"]
+    for pos, task in enumerate(result.tasks, start=1):
+        start_dt = dt_base + timedelta(minutes=task.start_min)
+        end_dt   = dt_base + timedelta(minutes=task.end_min)
+        dur_min  = task.duration_min
         hours    = round(dur_min / 60, 4)
-
         rows.append((
-            plan_date.isoformat(),
-            task["machine"],
-            task["part_number"],
-            task.get("process", ""),
-            task.get("quantity", 0),
-            start_dt.strftime("%H:%M:%S"),
-            end_dt.strftime("%H:%M:%S"),
-            dur_min,
-            pos,
-            0,
-            task.get("spm", 0),
-            task.get("ppm", 0),
-            hours,
-            hours,
+            plan_date.isoformat(), task.machine_id, task.part_number,
+            task.process_name, task.quantity,
+            start_dt.strftime("%H:%M:%S"), end_dt.strftime("%H:%M:%S"),
+            dur_min, pos, 0, 0, 0, hours, hours,
         ))
 
     cursor.executemany(insert_sql, rows)

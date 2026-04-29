@@ -9,12 +9,13 @@ Reglas estrictas:
   - Se devuelven dataclasses o dicts planos, nunca cursors ni Row objects.
   - Las queries usan parámetros posicionales (%s) para evitar SQL injection.
 
-Tablas que usa este módulo:
+Tablas usadas:
   - machines          : catálogo de máquinas
   - rutas             : pasos de ruta por número de parte
   - rutas_maquinas    : máquinas elegibles por paso (incluyendo alternativas)
+  - part_prod         : metadatos de parte (customer, project, workcenter, SPM)
   - schedule          : órdenes de producción abiertas
-  - part_production   : SPH y operador por número de parte
+  - part_production   : SPH por número de parte
   - production_plan   : plan guardado por el scheduler
 """
 
@@ -26,18 +27,99 @@ from typing import Any
 
 from mysql.connector import MySQLConnection
 
-from .models import Machine, Order, Route
+from .models import (
+    CycleTime,
+    Machine,
+    Order,
+    Part,
+    PlanningData,
+    Route,
+    ScheduledTask,
+    ScheduleResult,
+    Shift,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# MÁQUINAS
+# EXCEPCIÓN PÚBLICA — exportada por __init__.py
 # ===========================================================================
 
-def get_machines(conn: MySQLConnection) -> list[Machine]:
+class RepositoryDataError(Exception):
     """
-    Devuelve todas las máquinas del catálogo ordenadas por área y nombre.
+    Se lanza cuando los datos cargados desde la BD son inconsistentes
+    o insuficientes para construir un plan válido.
+
+    Ejemplos:
+      - No hay máquinas activas en la BD
+      - Una parte tiene ruta pero sus máquinas no existen en machines
+      - La tabla rutas_maquinas está vacía después del seed
+    """
+
+
+# ===========================================================================
+# FUNCIÓN PRINCIPAL — load_planning_data()
+# ===========================================================================
+
+def load_planning_data(
+    conn: MySQLConnection,
+    plan_date: date,
+) -> PlanningData:
+    """
+    Carga todos los datos necesarios para una corrida del scheduler
+    en una sola llamada.
+
+    Devuelve un PlanningData con:
+      - machines        : dict[int, Machine]
+      - parts           : dict[str, Part]
+      - routes_by_part  : dict[str, list[Route]]
+      - cycle_times     : dict[tuple[str, int], CycleTime]
+      - orders          : list[Order]
+      - shifts          : list[Shift]  (vacío si no hay tabla shifts)
+
+    Lanza RepositoryDataError si los datos son inválidos.
+
+    Esta función es el punto de entrada único para service.py — en lugar
+    de llamar a get_machines(), get_routes(), etc. por separado, se llama
+    a load_planning_data() una sola vez y se obtiene todo.
+    """
+    machines   = _load_machines(conn)
+    parts      = _load_parts(conn)
+    routes     = _load_routes(conn)
+    cycle_times = _load_cycle_times(conn)
+    orders     = _load_orders(conn, plan_date)
+    shifts     = _load_shifts(conn)
+
+    if not machines:
+        raise RepositoryDataError(
+            "No hay máquinas activas en la BD. "
+            "Verifica que el seed_rutas.sql se aplicó correctamente."
+        )
+
+    logger.info(
+        "load_planning_data | fecha=%s máquinas=%d partes=%d rutas=%d órdenes=%d",
+        plan_date, len(machines), len(parts), sum(len(v) for v in routes.values()), len(orders),
+    )
+
+    return PlanningData(
+        machines=machines,
+        parts=parts,
+        routes_by_part=routes,
+        cycle_times=cycle_times,
+        orders=orders,
+        shifts=shifts,
+    )
+
+
+# ===========================================================================
+# LOADERS PRIVADOS
+# ===========================================================================
+
+def _load_machines(conn: MySQLConnection) -> dict[int, Machine]:
+    """
+    Carga todas las máquinas.
+    Mapea el campo Area de la BD al process_name del modelo.
     """
     sql = """
         SELECT id, Machine, Area
@@ -49,28 +131,58 @@ def get_machines(conn: MySQLConnection) -> list[Machine]:
     rows = cursor.fetchall()
     cursor.close()
 
-    return [
-        Machine(
+    result: dict[int, Machine] = {}
+    for row in rows:
+        result[row["id"]] = Machine(
             id=row["id"],
             name=row["Machine"],
             area=row["Area"] or "",
+            process_name=row["Area"] or "",   # Area == proceso en nuestro schema
+            tonnage_ton=None,                  # No está en el schema actual
+            active=True,                       # Todas las de BD se consideran activas
         )
-        for row in rows
-    ]
+    return result
 
 
-# ===========================================================================
-# RUTAS
-# ===========================================================================
-
-def get_all_routes(conn: MySQLConnection) -> list[Route]:
+def _load_parts(conn: MySQLConnection) -> dict[str, Part]:
     """
-    Devuelve todas las rutas con sus máquinas elegibles.
+    Carga metadatos de partes desde part_prod.
+    part_prod tiene: Part_No, Customer, Project, Workcenter, SPM_Plan, Man, SPC
+    """
+    sql = """
+        SELECT Part_No, Customer, Project, Workcenter,
+               COALESCE(SPM_Plan, 0) AS SPM_Plan
+        FROM   part_prod
+        ORDER  BY Part_No
+    """
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    cursor.close()
 
-    Hace un JOIN con rutas_maquinas para traer, por cada paso, la lista
-    completa de máquinas entre las que el solver puede elegir.
-    La máquina registrada en rutas.machine_id se considera la primaria;
-    cualquier otra en rutas_maquinas para ese mismo ruta_id es alternativa.
+    result: dict[str, Part] = {}
+    for row in rows:
+        result[row["Part_No"]] = Part(
+            part_number=row["Part_No"],
+            customer=row["Customer"] or "",
+            project=row["Project"] or "",
+            workcenter=row["Workcenter"] or "",
+            spm_plan=float(row["SPM_Plan"] or 0),
+            weight_kg=None,
+            active=True,
+        )
+    return result
+
+
+def _load_routes(conn: MySQLConnection) -> dict[str, list[Route]]:
+    """
+    Carga rutas con sus máquinas elegibles desde rutas + rutas_maquinas.
+
+    Por cada paso (ruta_id) se agrupan todas las máquinas elegibles en
+    Route.alternative_machine_ids, siguiendo el modelo real de models.py.
+
+    Route.machine_id       = máquina primaria (la de rutas.machine_id)
+    Route.alternative_machine_ids = las demás máquinas de rutas_maquinas
     """
     sql = """
         SELECT
@@ -80,14 +192,9 @@ def get_all_routes(conn: MySQLConnection) -> list[Route]:
             r.process_name,
             r.setup_time_min,
             r.machine_id      AS primary_machine_id,
-            m_primary.Machine AS primary_machine_name,
-            rm.machine_id     AS eligible_machine_id,
-            m_elig.Machine    AS eligible_machine_name,
-            rm.cycle_time_min
+            rm.machine_id     AS eligible_machine_id
         FROM      rutas          r
-        JOIN      machines       m_primary ON m_primary.id = r.machine_id
-        JOIN      rutas_maquinas rm        ON rm.ruta_id   = r.id
-        JOIN      machines       m_elig    ON m_elig.id    = rm.machine_id
+        JOIN      rutas_maquinas rm ON rm.ruta_id = r.id
         ORDER BY  r.part_number, r.step_order, rm.machine_id
     """
     cursor = conn.cursor(dictionary=True)
@@ -95,66 +202,93 @@ def get_all_routes(conn: MySQLConnection) -> list[Route]:
     rows = cursor.fetchall()
     cursor.close()
 
-    # Agrupar por ruta_id para construir la lista de máquinas elegibles
-    routes_map: dict[int, Route] = {}
-
+    # Agrupar por ruta_id
+    # {ruta_id: {"base": row, "eligible": [machine_id, ...]}}
+    ruta_map: dict[int, dict] = {}
     for row in rows:
         rid = row["ruta_id"]
-        if rid not in routes_map:
-            routes_map[rid] = Route(
-                id=rid,
-                part_number=row["part_number"],
-                step_order=row["step_order"],
-                process_name=row["process_name"],
-                setup_time_min=row["setup_time_min"],
-                primary_machine=row["primary_machine_name"],
-                alt_machines=[],
-                cycle_time_min=float(row["cycle_time_min"] or 0),
-            )
+        if rid not in ruta_map:
+            ruta_map[rid] = {
+                "base":     row,
+                "eligible": [],
+            }
+        ruta_map[rid]["eligible"].append(row["eligible_machine_id"])
 
-        route = routes_map[rid]
-        mach_name = row["eligible_machine_name"]
-        if (mach_name != route.primary_machine
-                and mach_name not in route.alt_machines):
-            route.alt_machines.append(mach_name)
+    # Construir Route objects
+    routes_by_part: dict[str, list[Route]] = {}
+    for rid, data in ruta_map.items():
+        base    = data["base"]
+        primary = base["primary_machine_id"]
+        alts    = [m for m in data["eligible"] if m != primary]
 
-    return list(routes_map.values())
+        route = Route(
+            id=rid,
+            part_number=base["part_number"],
+            step_order=base["step_order"],
+            process_name=base["process_name"],
+            machine_id=primary,
+            setup_time_min=base["setup_time_min"],
+            alternative_machine_ids=alts,
+        )
+        routes_by_part.setdefault(base["part_number"], []).append(route)
+
+    # Ordenar pasos por step_order dentro de cada parte
+    for part_number in routes_by_part:
+        routes_by_part[part_number].sort(key=lambda r: r.step_order)
+
+    return routes_by_part
 
 
-def get_routes_for_part(conn: MySQLConnection, part_number: str) -> list[Route]:
+def _load_cycle_times(conn: MySQLConnection) -> dict[tuple[str, int], CycleTime]:
     """
-    Devuelve los pasos de ruta de un número de parte específico.
-    Reutiliza get_all_routes y filtra en memoria — la tabla rutas es pequeña
-    (236 filas) así que no justifica una query adicional.
-    """
-    all_routes = get_all_routes(conn)
-    return [r for r in all_routes if r.part_number == part_number]
+    Carga tiempos de ciclo desde rutas_maquinas.
+    Llave: (part_number, machine_id)
 
-
-# ===========================================================================
-# ÓRDENES ABIERTAS
-# ===========================================================================
-
-def get_open_orders(conn: MySQLConnection, plan_date: date) -> list[Order]:
-    """
-    Devuelve las órdenes de producción a planificar para plan_date.
-
-    Fuente: tabla `schedule` (órdenes abiertas del ERP).
-    JOIN con part_production para obtener el SPH real de cada parte,
-    ya que schedule.Duration puede no estar disponible en todos los registros.
-
-    La due_date se calcula como plan_date + 7 días (objetivo de stock semanal).
+    cycle_time_min en rutas_maquinas fue calculado como 60/SPM
+    durante el seed, así que ya está en minutos por pieza.
     """
     sql = """
         SELECT
-            s.ID          AS order_id,
-            s.Part_No     AS part_number,
-            s.Quantity    AS quantity,
-            s.Workcenter  AS workcenter,
-            s.Date        AS order_date,
-            COALESCE(pp.SPH, 0) AS sph
+            r.part_number,
+            rm.machine_id,
+            rm.cycle_time_min
+        FROM  rutas_maquinas rm
+        JOIN  rutas r ON r.id = rm.ruta_id
+        WHERE rm.cycle_time_min > 0
+    """
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    result: dict[tuple[str, int], CycleTime] = {}
+    for row in rows:
+        key = (row["part_number"], row["machine_id"])
+        # Si hay múltiples pasos para la misma (parte, máquina), guardamos
+        # el primero encontrado — son tiempos de ciclo del mismo proceso
+        if key not in result:
+            result[key] = CycleTime(
+                part_number=row["part_number"],
+                machine_id=row["machine_id"],
+                cycle_time_min=float(row["cycle_time_min"]),
+            )
+    return result
+
+
+def _load_orders(conn: MySQLConnection, plan_date: date) -> list[Order]:
+    """
+    Carga órdenes abiertas para plan_date desde la tabla schedule.
+    due_date = plan_date + 7 días (objetivo de stock semanal).
+    """
+    sql = """
+        SELECT
+            s.ID       AS order_id,
+            s.Part_No  AS part_number,
+            s.Quantity AS quantity,
+            s.Date     AS order_date,
+            COALESCE(pp.Customer, '') AS customer
         FROM  schedule s
-        LEFT JOIN part_production pp ON pp.Part_No = s.Part_No
+        LEFT JOIN part_prod pp ON pp.Part_No = s.Part_No
         WHERE s.Date = %s
         ORDER BY s.ID
     """
@@ -167,38 +301,73 @@ def get_open_orders(conn: MySQLConnection, plan_date: date) -> list[Order]:
 
     orders = []
     for row in rows:
-        sph = int(row["sph"] or 0)
-        cycle_time_min = round(60.0 / sph, 4) if sph > 0 else 0.0
-
         orders.append(Order(
             id=row["order_id"],
             part_number=row["part_number"],
+            customer=row["customer"],
             quantity=row["quantity"],
             due_date=due_date,
             priority=1,
-            cycle_time_min=cycle_time_min,
+            status="open",
         ))
 
-    logger.info("get_open_orders | fecha=%s órdenes=%d", plan_date, len(orders))
+    logger.info("_load_orders | fecha=%s órdenes=%d", plan_date, len(orders))
     return orders
 
 
+def _load_shifts(conn: MySQLConnection) -> list[Shift]:
+    """
+    Intenta cargar turnos desde la BD.
+    Si la tabla no existe o está vacía, devuelve lista vacía —
+    scheduler.py usará el ShiftConfig por defecto (fallback seguro).
+    """
+    try:
+        sql = """
+            SELECT id, name, start_min, end_min, active
+            FROM   shifts
+            WHERE  active = 1
+            ORDER  BY id
+        """
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+        cursor.close()
+
+        return [
+            Shift(
+                id=row["id"],
+                name=row["name"],
+                start_min=row["start_min"],
+                end_min=row["end_min"],
+                active=bool(row["active"]),
+            )
+            for row in rows
+        ]
+    except Exception:
+        # La tabla shifts puede no existir aún — es un escenario válido
+        logger.info("Tabla shifts no disponible — se usará ShiftConfig por defecto.")
+        return []
+
+
 # ===========================================================================
-# PLAN GUARDADO  — NUEVA 1/2
+# FUNCIONES PÚBLICAS ADICIONALES (usadas por planning.py directamente)
 # ===========================================================================
+
+def get_machines(conn: MySQLConnection) -> list[Machine]:
+    """Devuelve lista de Machine para los endpoints de catálogo."""
+    return list(_load_machines(conn).values())
+
+
+def get_routes_for_part(conn: MySQLConnection, part_number: str) -> list[Route]:
+    """Devuelve los pasos de ruta de un número de parte específico."""
+    routes = _load_routes(conn)
+    return routes.get(part_number, [])
+
 
 def get_plan_by_date(conn: MySQLConnection, plan_date: date) -> list[dict[str, Any]]:
     """
-    Devuelve el plan de producción guardado para una fecha específica.
-
-    Consulta production_plan y devuelve una lista de dicts ordenada por
-    Position (el orden de ejecución dentro del plan).
-    Devuelve lista vacía si no hay plan guardado para esa fecha.
-
-    Nota sobre tipos: convierte Decimal → float y timedelta → str para que
-    jsonify no lance TypeError al serializar.
-
-    Usado por: GET /api/planning/plan?date=YYYY-MM-DD
+    Devuelve el plan guardado para una fecha desde production_plan.
+    Usado por GET /api/planning/plan
     """
     sql = """
         SELECT
@@ -226,18 +395,14 @@ def get_plan_by_date(conn: MySQLConnection, plan_date: date) -> list[dict[str, A
 
     result = []
     for row in rows:
-        # MySQL devuelve TIME como timedelta; lo convertimos a string "HH:MM:SS"
-        start = row["start_time"]
-        end   = row["end_time"]
-
         result.append({
             "id":           row["id"],
             "machine":      row["machine"],
             "part_number":  row["part_number"],
             "operation":    row["operation"],
             "quantity":     row["quantity"],
-            "start_time":   _fmt_time(start),
-            "end_time":     _fmt_time(end),
+            "start_time":   _fmt_time(row["start_time"]),
+            "end_time":     _fmt_time(row["end_time"]),
             "duration_min": float(row["duration_min"] or 0),
             "hours":        float(row["hours"] or 0),
             "spm":          int(row["spm"] or 0),
@@ -246,15 +411,9 @@ def get_plan_by_date(conn: MySQLConnection, plan_date: date) -> list[dict[str, A
             "stop_program": row["stop_program"],
         })
 
-    logger.info(
-        "get_plan_by_date | fecha=%s registros=%d", plan_date, len(result)
-    )
+    logger.info("get_plan_by_date | fecha=%s registros=%d", plan_date, len(result))
     return result
 
-
-# ===========================================================================
-# ESTADO DE STOCK  — NUEVA 2/2
-# ===========================================================================
 
 def get_stock_summary(
     conn: MySQLConnection,
@@ -262,86 +421,44 @@ def get_stock_summary(
     deadline: date,
 ) -> dict[str, Any]:
     """
-    Calcula el estado de stock por número de parte entre reference_date y deadline.
-
-    Lógica en tres pasos:
-      1. Suma unidades planificadas en production_plan para el rango de fechas.
-      2. Obtiene el target semanal desde la última orden en schedule.
-      3. Compara planned vs target y asigna status:
-            ok       → coverage >= 100 %
-            warning  → coverage >= 50 %
-            critical → coverage <  50 %
-
-    Usado por: GET /api/planning/stock?date=YYYY-MM-DD
+    Estado de stock por parte entre reference_date y deadline.
+    Usado por GET /api/planning/stock
     """
-
-    # ── Paso 1: unidades planificadas por parte en el rango ─────────────
     sql_planned = """
-        SELECT
-            Part_No       AS part_number,
-            SUM(Quantity) AS planned_qty
-        FROM  production_plan
-        WHERE Date >= %s
-          AND Date <= %s
-        GROUP BY Part_No
+        SELECT Part_No AS part_number, SUM(Quantity) AS planned_qty
+        FROM   production_plan
+        WHERE  Date >= %s AND Date <= %s
+        GROUP  BY Part_No
     """
     cursor = conn.cursor(dictionary=True)
     cursor.execute(sql_planned, (reference_date.isoformat(), deadline.isoformat()))
-    planned_rows = cursor.fetchall()
+    planned_map = {r["part_number"]: int(r["planned_qty"] or 0)
+                   for r in cursor.fetchall()}
     cursor.close()
 
-    planned_map: dict[str, int] = {
-        row["part_number"]: int(row["planned_qty"] or 0)
-        for row in planned_rows
-    }
-
-    # ── Paso 2: target semanal por parte ──────────────────────────────
-    # Se toma la cantidad de la orden activa más reciente hasta el deadline.
-    # Subconsulta correlacionada para obtener el MAX(Date) por parte.
     sql_target = """
-        SELECT
-            s.Part_No  AS part_number,
-            s.Quantity AS target_qty
-        FROM  schedule s
+        SELECT s.Part_No AS part_number, s.Quantity AS target_qty
+        FROM   schedule s
         INNER JOIN (
             SELECT Part_No, MAX(Date) AS last_date
             FROM   schedule
             WHERE  Date <= %s
             GROUP  BY Part_No
-        ) latest ON latest.Part_No = s.Part_No
-                 AND latest.last_date = s.Date
+        ) latest ON latest.Part_No = s.Part_No AND latest.last_date = s.Date
     """
     cursor = conn.cursor(dictionary=True)
     cursor.execute(sql_target, (deadline.isoformat(),))
-    target_rows = cursor.fetchall()
+    target_map = {r["part_number"]: int(r["target_qty"] or 0)
+                  for r in cursor.fetchall()}
     cursor.close()
 
-    target_map: dict[str, int] = {
-        row["part_number"]: int(row["target_qty"] or 0)
-        for row in target_rows
-    }
-
-    # ── Paso 3: combinar y calcular status ───────────────────────────
-    all_parts = set(planned_map.keys()) | set(target_map.keys())
-
+    all_parts = set(planned_map) | set(target_map)
     parts = []
     for part in sorted(all_parts):
         planned = planned_map.get(part, 0)
         target  = target_map.get(part, 0)
-
-        if target > 0:
-            coverage_pct = round(planned / target * 100, 1)
-        else:
-            # Sin orden de referencia: si hay producción planeada → ok
-            coverage_pct = 100.0 if planned > 0 else 0.0
-
-        if coverage_pct >= 100:
-            status = "ok"
-        elif coverage_pct >= 50:
-            status = "warning"
-        else:
-            status = "critical"
-
+        coverage_pct = round(planned / target * 100, 1) if target > 0 else (100.0 if planned > 0 else 0.0)
+        status = "ok" if coverage_pct >= 100 else ("warning" if coverage_pct >= 50 else "critical")
         parts.append({
             "part_number":  part,
             "planned_qty":  planned,
@@ -350,11 +467,8 @@ def get_stock_summary(
             "status":       status,
         })
 
-    logger.info(
-        "get_stock_summary | ref=%s deadline=%s partes=%d",
-        reference_date, deadline, len(parts),
-    )
-
+    logger.info("get_stock_summary | ref=%s deadline=%s partes=%d",
+                reference_date, deadline, len(parts))
     return {
         "reference_date": reference_date.isoformat(),
         "deadline":       deadline.isoformat(),
@@ -367,25 +481,15 @@ def get_stock_summary(
 # ===========================================================================
 
 def _fmt_time(value: Any) -> str | None:
-    """
-    Convierte un valor TIME de MySQL a string "HH:MM:SS".
-
-    MySQL connector devuelve columnas TIME como objetos timedelta (no time),
-    así que no podemos usar .strftime(). Calculamos la conversión manual.
-    Devuelve None si el valor es None.
-    """
+    """Convierte TIME de MySQL (timedelta) a string HH:MM:SS."""
     if value is None:
         return None
-
-    # Si ya es string, devolverlo directo
     if isinstance(value, str):
         return value
-
-    # timedelta: total_seconds() -> horas, minutos, segundos
     try:
         total_secs = int(value.total_seconds())
-        hours, remainder = divmod(total_secs, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        h, rem = divmod(total_secs, 3600)
+        m, s   = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
     except AttributeError:
         return str(value)
