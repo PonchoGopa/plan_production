@@ -32,7 +32,7 @@ from .models import (
     Machine, Part, Order, RouteStep, Shift,
     ScheduledTask, ScheduleResult,
 )
-from ..config import SolverConfig, ShiftConfig
+from .config import SolverConfig, ShiftConfig
 
 
 # ══════════════════════════════════════════════════════════════════
