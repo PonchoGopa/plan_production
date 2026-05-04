@@ -221,10 +221,10 @@ def get_routes():
         {
             "step_order":      r.step_order,
             "process":         r.process_name,
-            "primary_machine": r.primary_machine,
-            "alt_machines":    r.alt_machines,
+            "machine_id":      r.machine_id,
+            "alt_machine_ids": r.alternative_machine_ids,
+            "eligible_ids":    r.eligible_machine_ids,
             "setup_time_min":  r.setup_time_min,
-            "cycle_time_min":  r.cycle_time_min,
         }
         for r in routes
     ]
