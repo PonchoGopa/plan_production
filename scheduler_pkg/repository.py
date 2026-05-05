@@ -22,6 +22,7 @@ Tablas usadas:
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import date, timedelta
 from typing import Any
 
@@ -88,6 +89,7 @@ def load_planning_data(
     parts      = _load_parts(conn)
     routes     = _load_routes(conn)
     cycle_times = _load_cycle_times(conn)
+    parts      = _attach_planning_details(parts, routes, cycle_times)
     orders     = _load_orders(conn, plan_date)
     shifts     = _load_shifts(conn)
 
@@ -110,6 +112,46 @@ def load_planning_data(
         orders=orders,
         shifts=shifts,
     )
+
+
+def _attach_planning_details(
+    parts: dict[str, Part],
+    routes: dict[str, list[Route]],
+    cycle_times: dict[tuple[str, int], CycleTime],
+) -> dict[str, Part]:
+    """
+    Devuelve Part enriquecidos con rutas y tiempos de ciclo.
+
+    scheduler.py consume estos datos desde Part.route_steps y
+    Part.cycle_times; PlanningData.routes_by_part se conserva para
+    diagnóstico/endpoints, pero el solver trabaja contra parts.
+    """
+    enriched: dict[str, Part] = {}
+    all_part_numbers = set(parts) | set(routes) | {
+        part_number for part_number, _machine_id in cycle_times
+    }
+
+    for part_number in all_part_numbers:
+        part = parts.get(part_number) or Part(
+            part_number=part_number,
+            customer="",
+            project="",
+            workcenter="",
+            spm_plan=0,
+            weight_kg=None,
+            active=True,
+        )
+        part_cycle_times = {
+            machine_id: cycle_time
+            for (ct_part_number, machine_id), cycle_time in cycle_times.items()
+            if ct_part_number == part_number
+        }
+        enriched[part_number] = replace(
+            part,
+            route_steps=routes.get(part_number, []),
+            cycle_times=part_cycle_times,
+        )
+    return enriched
 
 
 # ===========================================================================

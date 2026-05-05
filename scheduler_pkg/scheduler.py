@@ -30,7 +30,7 @@ from ortools.sat.python import cp_model
 
 from .models import (
     Machine, Part, Order, RouteStep, Shift,
-    ScheduledTask, ScheduleResult,
+    ScheduledTask, ScheduleResult, UnscheduledOrder,
 )
 from .config import SolverConfig, ShiftConfig
 
@@ -161,7 +161,7 @@ def _build_implicit_route(
             process_name=proc,
             machine_id=machine_id,
             setup_time_min=0,
-            alt_machine_ids=[],
+            alternative_machine_ids=[],
         ))
         fake_id -= 1
 
@@ -290,6 +290,7 @@ class _TaskVar:
     duration: int
     order_id: int
     part_number: str
+    route_id: int
     step_order: int
     process_name: str
     machine_id: int
@@ -444,6 +445,7 @@ def build_model(
                     duration=duration,
                     order_id=order.id,
                     part_number=pn,
+                    route_id=step.id,
                     step_order=step.step_order,
                     process_name=step.process_name,
                     machine_id=mid,
@@ -597,8 +599,18 @@ def _extract_results(
     # solver.Solve() retorna el status; se pasa aquí como parámetro
     status_str = status_map.get(solve_status, "UNKNOWN")
 
+    if solve_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return ScheduleResult(
+            solver_status=status_str,
+            makespan_min=0,
+            tasks=[],
+            unscheduled_order_ids=[o.id for o in orders],
+            wall_time_seconds=wall_time,
+        )
+
     tasks: list[ScheduledTask] = []
     scheduled_order_ids: set[int] = set()
+    order_qty = {o.id: o.quantity for o in orders}
 
     for (order_id, step_order, machine_id), tv in task_vars.items():
         if not solver.BooleanValue(tv.is_active):
@@ -610,21 +622,17 @@ def _extract_results(
         task = ScheduledTask(
             order_id=order_id,
             part_number=tv.part_number,
+            route_id=tv.route_id,
             step_order=step_order,
             process_name=tv.process_name,
             machine_id=machine_id,
             machine_name=machine_name,
             start_min=solver.Value(tv.start),
             end_min=solver.Value(tv.end),
-            quantity=0,  # Se llena abajo
+            quantity=order_qty.get(order_id, 0),
         )
         tasks.append(task)
         scheduled_order_ids.add(order_id)
-
-    # Llenar las cantidades desde las órdenes originales
-    order_qty = {o.id: o.quantity for o in orders}
-    for task in tasks:
-        task.quantity = order_qty.get(task.order_id, 0)
 
     # Ordenar por start_min para el Gantt
     tasks.sort(key=lambda t: (t.start_min, t.machine_id))
@@ -645,9 +653,78 @@ def _extract_results(
     )
 
 
-# ══════════════════════════════════════════════════════════════════
-# STEP 5 — FUNCIÓN PÚBLICA PRINCIPAL
-# ══════════════════════════════════════════════════════════════════
+def _diagnose_order(
+    order: Order,
+    steps: list[RouteStep],
+    parts: dict[str, Part],
+    machines: dict[int, Machine],
+    horizon: int,
+) -> UnscheduledOrder | None:
+    """Devuelve el motivo de no programación, o None si la orden es viable."""
+    if not steps:
+        return UnscheduledOrder(
+            order_id=order.id,
+            part_number=order.part_number,
+            quantity=order.quantity,
+            reason="no_route",
+            estimated_min=0,
+            horizon_min=horizon,
+            detail="La parte no tiene pasos de ruta reales ni ruta inferida.",
+        )
+
+    total_best_duration = 0
+    for step in steps:
+        valid_machine_ids = [
+            mid
+            for mid in step.eligible_machines
+            if mid in machines and machines[mid].activa
+        ]
+        if not valid_machine_ids:
+            return UnscheduledOrder(
+                order_id=order.id,
+                part_number=order.part_number,
+                quantity=order.quantity,
+                reason="no_valid_machine",
+                estimated_min=total_best_duration,
+                horizon_min=horizon,
+                detail=f"El paso {step.step_order} no tiene máquinas elegibles activas.",
+            )
+
+        best_step_duration = min(
+            _compute_duration(step, order, parts, mid)
+            for mid in valid_machine_ids
+        )
+        if best_step_duration > horizon:
+            return UnscheduledOrder(
+                order_id=order.id,
+                part_number=order.part_number,
+                quantity=order.quantity,
+                reason="step_exceeds_horizon",
+                estimated_min=best_step_duration,
+                horizon_min=horizon,
+                detail=(
+                    f"El paso {step.step_order} requiere al menos "
+                    f"{best_step_duration} min y el horizonte es {horizon} min."
+                ),
+            )
+        total_best_duration += best_step_duration
+
+    if total_best_duration > horizon:
+        return UnscheduledOrder(
+            order_id=order.id,
+            part_number=order.part_number,
+            quantity=order.quantity,
+            reason="route_exceeds_horizon",
+            estimated_min=total_best_duration,
+            horizon_min=horizon,
+            detail=(
+                f"La ruta completa requiere al menos {total_best_duration} min "
+                f"y el horizonte es {horizon} min."
+            ),
+        )
+
+    return None
+
 
 def solve(
     orders: list[Order],
@@ -686,25 +763,71 @@ def solve(
     # Filtrar órdenes sin partes conocidas
     valid_orders = [o for o in orders if o.part_number in parts]
     if not valid_orders:
+        diagnostics = [
+            UnscheduledOrder(
+                order_id=o.id,
+                part_number=o.part_number,
+                quantity=o.quantity,
+                reason="unknown_part",
+                estimated_min=0,
+                horizon_min=solver_config.horizon_minutes,
+                detail="La orden existe en schedule, pero la parte no existe en part_prod/rutas.",
+            )
+            for o in orders
+        ]
         return ScheduleResult(
             solver_status="INFEASIBLE",
             makespan_min=0,
-            unscheduled_order_ids=[o.id for o in orders],
+            unscheduled_order_ids=[d.order_id for d in diagnostics],
+            unscheduled_orders=diagnostics,
         )
 
     # ── Paso 1: rutas ────────────────────────────────────────────
     routes = build_routes(parts, machines)
+    horizon = solver_config.horizon_minutes
 
-    # Filtrar órdenes cuya parte no tiene ruta
-    schedulable = [o for o in valid_orders if o.part_number in routes]
-    unschedulable = [o for o in valid_orders if o.part_number not in routes]
+    # Filtrar órdenes cuya parte no tiene ruta/capacidad suficiente
+    schedulable: list[Order] = []
+    diagnostics: list[UnscheduledOrder] = []
+
+    for order in valid_orders:
+        diagnostic = _diagnose_order(
+            order=order,
+            steps=routes.get(order.part_number, []),
+            parts=parts,
+            machines=machines,
+            horizon=horizon,
+        )
+
+        if diagnostic:
+            diagnostics.append(diagnostic)
+        else:
+            schedulable.append(order)
+
+    diagnostics.extend(
+        UnscheduledOrder(
+            order_id=o.id,
+            part_number=o.part_number,
+            quantity=o.quantity,
+            reason="unknown_part",
+            estimated_min=0,
+            horizon_min=horizon,
+            detail="La orden existe en schedule, pero la parte no existe en part_prod/rutas.",
+        )
+        for o in orders
+        if o.part_number not in parts
+    )
+
+    unschedulable = [o for o in valid_orders if o not in schedulable]
 
     if not schedulable:
         return ScheduleResult(
             solver_status="INFEASIBLE",
             makespan_min=0,
-            unscheduled_order_ids=[o.id for o in orders],
+            unscheduled_order_ids=[d.order_id for d in diagnostics],
+            unscheduled_orders=diagnostics,
         )
+
 
     # ── Paso 2: ventanas de disponibilidad ──────────────────────
     active_shifts = [s for s in shifts if s.activo]
@@ -713,13 +836,11 @@ def solve(
         sc = shift_config or ShiftConfig()
         from .models import Shift as ShiftModel
         active_shifts = [
-            ShiftModel(id=1, name="Turno 1", start_min=sc.shift1_start_min, end_min=sc.shift1_end_min),
-            ShiftModel(id=2, name="Turno 2", start_min=sc.shift2_start_min, end_min=sc.shift2_end_min),
+            ShiftModel(id=1, name="Turno 1", start_min=sc.shift1_start_min, end_min=sc.shift1_end_min, active=True),
+            ShiftModel(id=2, name="Turno 2", start_min=sc.shift2_start_min, end_min=sc.shift2_end_min, active=True),
         ]
 
     availability = _build_availability_windows(active_shifts, solver_config.horizon_minutes)
-    horizon = solver_config.horizon_minutes
-
     # ── Paso 3: modelo ───────────────────────────────────────────
     model, task_vars = build_model(
         orders=schedulable,
@@ -751,5 +872,6 @@ def solve(
 
     # Agregar las órdenes no programables (sin ruta) a la lista de no programadas
     result.unscheduled_order_ids.extend([o.id for o in unschedulable])
+    result.unscheduled_orders.extend(diagnostics)
 
     return result

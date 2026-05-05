@@ -137,11 +137,23 @@ class ScheduledTask:
 
 
 @dataclass(frozen=True)
+class UnscheduledOrder:
+    order_id: int
+    part_number: str
+    quantity: int
+    reason: str
+    estimated_min: int
+    horizon_min: int
+    detail: str = ""
+
+
+@dataclass(frozen=True)
 class ScheduleResult:
     solver_status: str
     makespan_min: int
     tasks: list[ScheduledTask] = field(default_factory=list)
     unscheduled_order_ids: list[int] = field(default_factory=list)
+    unscheduled_orders: list[UnscheduledOrder] = field(default_factory=list)
     wall_time_seconds: float = 0.0
 
     @property

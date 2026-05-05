@@ -193,6 +193,19 @@ def _format_result(result, plan_date: date, horizon_min: int, shift_start: time)
             "quantity":     task.quantity,
         })
 
+    unscheduled_orders = [
+        {
+            "order_id":      item.order_id,
+            "part_number":   item.part_number,
+            "quantity":      item.quantity,
+            "reason":        item.reason,
+            "estimated_min": item.estimated_min,
+            "horizon_min":   item.horizon_min,
+            "detail":        item.detail,
+        }
+        for item in result.unscheduled_orders
+    ]
+
     messages = {
         "OPTIMAL":    f"Plan óptimo generado con {len(tasks)} tareas.",
         "FEASIBLE":   f"Plan factible generado con {len(tasks)} tareas.",
@@ -207,6 +220,7 @@ def _format_result(result, plan_date: date, horizon_min: int, shift_start: time)
         "tasks":                 tasks,
         "makespan_min":          result.makespan_min,
         "unscheduled_order_ids": result.unscheduled_order_ids,
+        "unscheduled_orders":    unscheduled_orders,
         "wall_time_seconds":     result.wall_time_seconds,
         "message":               messages.get(result.solver_status, result.solver_status),
     }
@@ -224,13 +238,15 @@ def _save_production_plan(
     dt_base = datetime.combine(dummy, shift_start)
 
     cursor.execute("DELETE FROM production_plan WHERE Date = %s", (plan_date.isoformat(),))
+    cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM production_plan")
+    next_id = int(cursor.fetchone()[0])
 
     insert_sql = """
         INSERT INTO production_plan
-            (Date, Machine, Part_No, Operation_Code, Quantity,
+            (id, Date, Machine, Part_No, Operation_Code, Quantity,
              Start_Time, End_Time, Duration_Min, Position, Stop_Program,
              SPM, PPM, Hours, Total_Hours)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     rows = []
     for pos, task in enumerate(result.tasks, start=1):
@@ -239,7 +255,7 @@ def _save_production_plan(
         dur_min  = task.duration_min
         hours    = round(dur_min / 60, 4)
         rows.append((
-            plan_date.isoformat(), task.machine_id, task.part_number,
+            next_id + pos - 1, plan_date.isoformat(), task.machine_id, task.part_number,
             task.process_name, task.quantity,
             start_dt.strftime("%H:%M:%S"), end_dt.strftime("%H:%M:%S"),
             dur_min, pos, 0, 0, 0, hours, hours,
