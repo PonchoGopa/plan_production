@@ -324,21 +324,29 @@ def _compute_duration(
         return step.setup_time_min + math.ceil(order.quantity / fallback_spm)
 
     # 1. Buscar tiempo de ciclo exacto para esta máquina
-    ct = part.cycle_times.get(machine_id)
-    if ct:
-        cycle_min = ct.cycle_time_min
-    else:
-        # 2. Buscar en cualquier máquina disponible
-        if part.cycle_times:
-            cycle_min = next(iter(part.cycle_times.values())).cycle_time_min
-        elif part.spm_plan and part.spm_plan > 0:
-            # 3. Calcular desde SPM_Plan
-            cycle_min = 1.0 / part.spm_plan
-        else:
-            cycle_min = 1.0 / fallback_spm
+    # 1. Usar SPM_Plan desde part_prod como fuente principal.
+    # SPM_Plan significa piezas por minuto.
+    if part.spm_plan and part.spm_plan > 0:
+        run_time_min = math.ceil(order.quantity / part.spm_plan)
 
-    duration = step.setup_time_min + math.ceil(order.quantity * cycle_min)
-    return max(1, duration)  # mínimo 1 minuto
+    else:
+        # 2. Fallback: buscar tiempo de ciclo exacto para esta máquina.
+        ct = part.cycle_times.get(machine_id)
+        if ct:
+            run_time_min = math.ceil(order.quantity * ct.cycle_time_min)
+
+        # 3. Fallback: buscar cualquier tiempo de ciclo disponible para la parte.
+        elif part.cycle_times:
+            fallback_cycle = next(iter(part.cycle_times.values())).cycle_time_min
+            run_time_min = math.ceil(order.quantity * fallback_cycle)
+
+        # 4. Último fallback conservador.
+        else:
+            run_time_min = math.ceil(order.quantity / fallback_spm)
+
+    duration = step.setup_time_min + run_time_min
+    return max(1, duration)
+
 
 
 def build_model(

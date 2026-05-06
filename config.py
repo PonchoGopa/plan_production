@@ -64,6 +64,18 @@ class DBConfig:
             "autocommit": self.autocommit,
         }
 
+    def for_database(self, database: str) -> "DBConfig":
+        return DBConfig(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=self.password,
+            database=database,
+            charset=self.charset,
+            autocommit=self.autocommit,
+        )
+
+
 
 @dataclass(frozen=True)
 class SolverConfig:

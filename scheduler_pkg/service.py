@@ -48,6 +48,16 @@ def _get_connection() -> MySQLConnection:
     cfg = from_env()
     return mysql.connector.connect(**cfg.db.as_connector_kwargs())
 
+def _get_plex_connection() -> MySQLConnection:
+    cfg = from_env()
+    plex_db = cfg.db.for_database("plex_data")
+    return mysql.connector.connect(**plex_db.as_connector_kwargs())
+
+def _get_quality_connection() -> MySQLConnection:
+    cfg = from_env()
+    quality_db = cfg.db.for_database("kimexquality")
+    return mysql.connector.connect(**quality_db.as_connector_kwargs())
+
 
 # ---------------------------------------------------------------------------
 # run_schedule()
@@ -81,9 +91,16 @@ def run_schedule(
     logger.info("run_schedule | fecha=%s turno=%s horizonte=%d min", plan_date, shift, horizon_min)
 
     conn = _get_connection()
+    plex_conn = _get_plex_connection()
+    quality_conn = _get_quality_connection()
     try:
         # ── Cargar todos los datos de una vez ──────────────────────────────
-        planning_data = load_planning_data(conn, plan_date)
+        planning_data = load_planning_data(
+            conn,
+            plan_date,
+            plex_conn=plex_conn,
+            quality_conn=quality_conn,
+        )
 
         if not planning_data.orders:
             return _empty_result(plan_date, horizon_min, "No hay órdenes abiertas.")
@@ -138,6 +155,8 @@ def run_schedule(
             "makespan_min": 0, "message": f"Error interno: {exc}",
         }
     finally:
+        quality_conn.close()
+        plex_conn.close()
         conn.close()
 
 

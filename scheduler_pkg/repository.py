@@ -66,6 +66,8 @@ class RepositoryDataError(Exception):
 def load_planning_data(
     conn: MySQLConnection,
     plan_date: date,
+    plex_conn: MySQLConnection | None = None,
+    quality_conn: MySQLConnection | None = None,
 ) -> PlanningData:
     """
     Carga todos los datos necesarios para una corrida del scheduler
@@ -87,10 +89,14 @@ def load_planning_data(
     """
     machines   = _load_machines(conn)
     parts      = _load_parts(conn)
+    quality_spm = load_quality_spm(quality_conn) if quality_conn is not None else {}
     routes     = _load_routes(conn)
     cycle_times = _load_cycle_times(conn)
-    parts      = _attach_planning_details(parts, routes, cycle_times)
-    orders     = _load_orders(conn, plan_date)
+    parts      = _attach_planning_details(parts, routes, cycle_times, quality_spm)
+    if plex_conn is not None:
+        orders = load_orders_from_sales_releases(plex_conn, plan_date)
+    else:
+        orders = _load_orders(conn, plan_date)
     shifts     = _load_shifts(conn)
 
     if not machines:
@@ -118,6 +124,7 @@ def _attach_planning_details(
     parts: dict[str, Part],
     routes: dict[str, list[Route]],
     cycle_times: dict[tuple[str, int], CycleTime],
+    quality_spm: dict[str, float] | None = None,
 ) -> dict[str, Part]:
     """
     Devuelve Part enriquecidos con rutas y tiempos de ciclo.
@@ -126,18 +133,20 @@ def _attach_planning_details(
     Part.cycle_times; PlanningData.routes_by_part se conserva para
     diagnóstico/endpoints, pero el solver trabaja contra parts.
     """
+    quality_spm = quality_spm or {}
     enriched: dict[str, Part] = {}
     all_part_numbers = set(parts) | set(routes) | {
         part_number for part_number, _machine_id in cycle_times
     }
 
     for part_number in all_part_numbers:
+        quality_part_spm = quality_spm.get(part_number, 0)
         part = parts.get(part_number) or Part(
             part_number=part_number,
             customer="",
             project="",
             workcenter="",
-            spm_plan=0,
+            spm_plan=quality_part_spm,
             weight_kg=None,
             active=True,
         )
@@ -146,11 +155,17 @@ def _attach_planning_details(
             for (ct_part_number, machine_id), cycle_time in cycle_times.items()
             if ct_part_number == part_number
         }
+        spm_plan = part.spm_plan
+        if (not spm_plan or spm_plan <= 0) and quality_part_spm > 0:
+            spm_plan = quality_part_spm
+
         enriched[part_number] = replace(
             part,
+            spm_plan=spm_plan,
             route_steps=routes.get(part_number, []),
             cycle_times=part_cycle_times,
         )
+
     return enriched
 
 
@@ -389,6 +404,165 @@ def _load_shifts(conn: MySQLConnection) -> list[Shift]:
         # La tabla shifts puede no existir aún — es un escenario válido
         logger.info("Tabla shifts no disponible — se usará ShiftConfig por defecto.")
         return []
+
+def load_sales_releases(
+    conn: MySQLConnection,
+    start_date: date,
+    end_date: date,
+    release_type: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Carga releases abiertos desde plex_data.sales_v_release.
+
+    Esta función espera recibir una conexión ya apuntando a plex_data.
+
+    Reglas:
+      - Usa Ship_Date como fecha operativa.
+      - Release_Type = 'Ship Schedule' representa cantidades firmes.
+      - Release_Type = 'Forecast' representa previsión.
+      - Si release_type es None, devuelve todos los tipos.
+    """
+    filters = [
+        "Ship_Date >= %s",
+        "Ship_Date <= %s",
+        "COALESCE(Release_Status, '') = 'Open'",
+    ]
+    params: list[Any] = [start_date.isoformat(), end_date.isoformat()]
+
+    if release_type:
+        filters.append("Release_Type = %s")
+        params.append(release_type)
+
+    sql = f"""
+        SELECT
+            Part_No AS part_number,
+            Release_Type AS release_type,
+            SUM(COALESCE(Quantity, 0)) AS quantity,
+            MIN(Ship_Date) AS first_ship_date,
+            MAX(Ship_Date) AS last_ship_date,
+            COUNT(*) AS release_count
+        FROM sales_v_release
+        WHERE {' AND '.join(filters)}
+        GROUP BY Part_No, Release_Type
+        ORDER BY Part_No, Release_Type
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql, tuple(params))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    result = []
+    for row in rows:
+        result.append({
+            "part_number": row["part_number"],
+            "release_type": row["release_type"],
+            "quantity": int(row["quantity"] or 0),
+            "first_ship_date": row["first_ship_date"].isoformat() if row["first_ship_date"] else None,
+            "last_ship_date": row["last_ship_date"].isoformat() if row["last_ship_date"] else None,
+            "release_count": int(row["release_count"] or 0),
+        })
+
+    logger.info(
+        "load_sales_releases | start=%s end=%s type=%s partes=%d",
+        start_date,
+        end_date,
+        release_type,
+        len(result),
+    )
+    return result
+
+def load_orders_from_sales_releases(
+    conn: MySQLConnection,
+    plan_date: date,
+) -> list[Order]:
+    """
+    Carga órdenes firmes desde plex_data.sales_v_release.
+
+    Reglas:
+      - Usa Ship_Date como fecha de programación.
+      - Usa solo Release_Type = 'Ship Schedule'.
+      - Usa solo Release_Status = 'Open'.
+      - Agrupa por Part_No porque puede haber más de un release del mismo día.
+    """
+    sql = """
+        SELECT
+            Part_No AS part_number,
+            SUM(COALESCE(Quantity, 0)) AS quantity,
+            MIN(Ship_Date) AS ship_date,
+            COUNT(*) AS release_count
+        FROM sales_v_release
+        WHERE Ship_Date = %s
+          AND COALESCE(Release_Status, '') = 'Open'
+          AND Release_Type = 'Ship Schedule'
+        GROUP BY Part_No
+        ORDER BY Part_No
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql, (plan_date.isoformat(),))
+    rows = cursor.fetchall()
+    cursor.close()
+
+    orders: list[Order] = []
+
+    for index, row in enumerate(rows, start=1):
+        orders.append(Order(
+            id=int(f"{plan_date:%Y%m%d}{index:03d}"),
+            part_number=row["part_number"],
+            customer="",
+            quantity=int(row["quantity"] or 0),
+            due_date=plan_date,
+            priority=1,
+            status="open",
+        ))
+
+    logger.info(
+        "load_orders_from_sales_releases | fecha=%s ordenes=%d",
+        plan_date,
+        len(orders),
+    )
+
+    return orders
+
+def load_quality_spm(
+    conn: MySQLConnection,
+) -> dict[str, float]:
+    """
+    Carga SPM desde kimexquality.part_quality.
+
+    Esta función espera recibir una conexión ya apuntando a kimexquality.
+
+    Devuelve:
+        {
+            "759033-00": 25.0,
+            "759034-00": 25.0,
+            ...
+        }
+
+    Si hay más de una fila por parte, usa el mayor SPM disponible.
+    """
+    sql = """
+        SELECT
+            Part_No AS part_number,
+            MAX(COALESCE(SPM, 0)) AS spm
+        FROM part_quality
+        WHERE COALESCE(SPM, 0) > 0
+        GROUP BY Part_No
+        ORDER BY Part_No
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    result: dict[str, float] = {}
+    for row in rows:
+        result[row["part_number"]] = float(row["spm"] or 0)
+
+    logger.info("load_quality_spm | partes=%d", len(result))
+    return result
 
 
 # ===========================================================================
