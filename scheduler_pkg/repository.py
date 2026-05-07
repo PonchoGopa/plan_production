@@ -89,10 +89,11 @@ def load_planning_data(
     """
     machines   = _load_machines(conn)
     parts      = _load_parts(conn)
+    press_spm  = _load_press_spm(conn)
     quality_spm = load_quality_spm(quality_conn) if quality_conn is not None else {}
     routes     = _load_routes(conn)
     cycle_times = _load_cycle_times(conn)
-    parts      = _attach_planning_details(parts, routes, cycle_times, quality_spm)
+    parts      = _attach_planning_details(parts, routes, cycle_times, quality_spm, press_spm)
     if plex_conn is not None:
         orders = load_orders_from_sales_releases(plex_conn, plan_date)
     else:
@@ -125,6 +126,7 @@ def _attach_planning_details(
     routes: dict[str, list[Route]],
     cycle_times: dict[tuple[str, int], CycleTime],
     quality_spm: dict[str, float] | None = None,
+    press_spm: dict[str, float] | None = None,
 ) -> dict[str, Part]:
     """
     Devuelve Part enriquecidos con rutas y tiempos de ciclo.
@@ -134,6 +136,7 @@ def _attach_planning_details(
     diagnóstico/endpoints, pero el solver trabaja contra parts.
     """
     quality_spm = quality_spm or {}
+    press_spm = press_spm or {}
     enriched: dict[str, Part] = {}
     all_part_numbers = set(parts) | set(routes) | {
         part_number for part_number, _machine_id in cycle_times
@@ -141,6 +144,14 @@ def _attach_planning_details(
 
     for part_number in all_part_numbers:
         quality_part_spm = quality_spm.get(part_number, 0)
+        press_part_spm = press_spm.get(part_number, 0)
+
+        process_spm: dict[str, float] = {}
+        if press_part_spm > 0:
+            process_spm["prensa"] = press_part_spm
+        if quality_part_spm > 0:
+            process_spm["inspeccion"] = quality_part_spm
+
         part = parts.get(part_number) or Part(
             part_number=part_number,
             customer="",
@@ -164,7 +175,9 @@ def _attach_planning_details(
             spm_plan=spm_plan,
             route_steps=routes.get(part_number, []),
             cycle_times=part_cycle_times,
+            process_spm=process_spm,
         )
+
 
     return enriched
 
@@ -230,6 +243,49 @@ def _load_parts(conn: MySQLConnection) -> dict[str, Part]:
         )
     return result
 
+def _load_press_spm(conn: MySQLConnection) -> dict[str, float]:
+    """
+    Carga SPM de prensas desde part_prod.
+
+    Algunas partes finales usan un número de parte intermedio para prensa,
+    por ejemplo:
+        759033-00      -> parte final
+        759033-00 PG1  -> parte de prensa
+
+    Este loader normaliza quitando el sufijo ' PG1' para mapearlo contra
+    la parte final.
+    """
+    sql = """
+        SELECT Part_No, COALESCE(SPM_Plan, 0) AS SPM_Plan
+        FROM part_prod
+        WHERE COALESCE(SPM_Plan, 0) > 0
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    cursor.close()
+
+    result: dict[str, float] = {}
+
+    for row in rows:
+        part_number = row["Part_No"]
+        spm = float(row["SPM_Plan"] or 0)
+
+        if not part_number or spm <= 0:
+            continue
+
+        normalized_part = part_number
+        if normalized_part.endswith(" PG1"):
+            normalized_part = normalized_part[:-4].strip()
+
+        if normalized_part not in result:
+            result[normalized_part] = spm
+        else:
+            result[normalized_part] = max(result[normalized_part], spm)
+
+    logger.info("_load_press_spm | partes=%d", len(result))
+    return result
 
 def _load_routes(conn: MySQLConnection) -> dict[str, list[Route]]:
     """
@@ -548,6 +604,7 @@ def load_quality_spm(
             MAX(COALESCE(SPM, 0)) AS spm
         FROM part_quality
         WHERE COALESCE(SPM, 0) > 0
+            AND UPPER(COALESCE(Operation_Code, '')) LIKE '%INSPECCION%'
         GROUP BY Part_No
         ORDER BY Part_No
     """

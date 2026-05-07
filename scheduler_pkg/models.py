@@ -116,6 +116,7 @@ class Part:
     # Se usan en scheduler.py para calcular duración de tareas
     route_steps: list[Route] = field(default_factory=list)
     cycle_times: dict[int, CycleTime] = field(default_factory=dict)
+    process_spm: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

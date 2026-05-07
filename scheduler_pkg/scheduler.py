@@ -326,21 +326,28 @@ def _compute_duration(
     # 1. Buscar tiempo de ciclo exacto para esta máquina
     # 1. Usar SPM_Plan desde part_prod como fuente principal.
     # SPM_Plan significa piezas por minuto.
-    if part.spm_plan and part.spm_plan > 0:
+    process_name = (step.process_name or "").strip().lower()
+    process_spm = part.process_spm.get(process_name)
+
+    if process_spm and process_spm > 0:
+        run_time_min = math.ceil(order.quantity / process_spm)
+
+    # 2. Usar SPM_Plan general desde part_prod como fallback.
+    elif part.spm_plan and part.spm_plan > 0:
         run_time_min = math.ceil(order.quantity / part.spm_plan)
 
     else:
-        # 2. Fallback: buscar tiempo de ciclo exacto para esta máquina.
+        # 3. Fallback: buscar tiempo de ciclo exacto para esta máquina.
         ct = part.cycle_times.get(machine_id)
         if ct:
             run_time_min = math.ceil(order.quantity * ct.cycle_time_min)
 
-        # 3. Fallback: buscar cualquier tiempo de ciclo disponible para la parte.
+        # 4. Fallback: buscar cualquier tiempo de ciclo disponible para la parte.
         elif part.cycle_times:
             fallback_cycle = next(iter(part.cycle_times.values())).cycle_time_min
             run_time_min = math.ceil(order.quantity * fallback_cycle)
 
-        # 4. Último fallback conservador.
+        # 5. Último fallback conservador.
         else:
             run_time_min = math.ceil(order.quantity / fallback_spm)
 
@@ -716,20 +723,6 @@ def _diagnose_order(
                 ),
             )
         total_best_duration += best_step_duration
-
-    if total_best_duration > horizon:
-        return UnscheduledOrder(
-            order_id=order.id,
-            part_number=order.part_number,
-            quantity=order.quantity,
-            reason="route_exceeds_horizon",
-            estimated_min=total_best_duration,
-            horizon_min=horizon,
-            detail=(
-                f"La ruta completa requiere al menos {total_best_duration} min "
-                f"y el horizonte es {horizon} min."
-            ),
-        )
 
     return None
 
