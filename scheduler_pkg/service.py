@@ -69,12 +69,15 @@ def run_schedule(
     shift_start: time | None = None,
     shift_end: time | None = None,
     save_plan: bool = False,
+    horizon_days: int = 1,
 ) -> dict[str, Any]:
     """
     Ejecuta el planificador completo para una fecha y turno dados.
     Devuelve un dict serializable a JSON.
     """
     plan_date = plan_date or date.today()
+
+    horizon_days = max(1, int(horizon_days or 1))
 
     # ── Horizonte de tiempo ────────────────────────────────────────────────
     if shift_start and shift_end:
@@ -84,9 +87,11 @@ def run_schedule(
             raise ValueError(f"Turno '{shift}' no válido. Opciones: {list(SHIFTS.keys())}")
         t_start, t_end = SHIFTS[shift]
 
-    horizon_min = _time_diff_minutes(t_start, t_end)
-    if horizon_min <= 0:
+    daily_horizon_min = _time_diff_minutes(t_start, t_end)
+    if daily_horizon_min <= 0:
         raise ValueError(f"shift_end debe ser posterior a shift_start.")
+
+    horizon_min = daily_horizon_min * horizon_days
 
     logger.info("run_schedule | fecha=%s turno=%s horizonte=%d min", plan_date, shift, horizon_min)
 
@@ -139,7 +144,7 @@ def run_schedule(
             conn.commit()
             logger.info("Plan persistido en production_plan.")
 
-        return _format_result(result, plan_date, horizon_min, t_start)
+        return _format_result(result, plan_date, horizon_min, t_start, daily_horizon_min)
 
     except RepositoryDataError as exc:
         conn.rollback()
@@ -182,6 +187,22 @@ def _time_diff_minutes(start: time, end: time) -> int:
     dummy = date(2000, 1, 1)
     return int((datetime.combine(dummy, end) - datetime.combine(dummy, start)).total_seconds() // 60)
 
+def _slot_to_datetime(
+    plan_date: date,
+    shift_start: time,
+    daily_horizon_min: int,
+    slot_min: int,
+    is_end: bool = False,
+) -> datetime:
+    if is_end and slot_min > 0 and slot_min % daily_horizon_min == 0:
+        day_offset = (slot_min // daily_horizon_min) - 1
+        minute_in_day = daily_horizon_min
+    else:
+        day_offset, minute_in_day = divmod(slot_min, daily_horizon_min)
+
+    day = plan_date + timedelta(days=day_offset)
+    return datetime.combine(day, shift_start) + timedelta(minutes=minute_in_day)
+
 
 def _empty_result(plan_date: date, horizon_min: int, message: str) -> dict[str, Any]:
     return {
@@ -190,27 +211,76 @@ def _empty_result(plan_date: date, horizon_min: int, message: str) -> dict[str, 
         "makespan_min": 0, "message": message,
     }
 
+def _split_task_segments(
+    task,
+    plan_date: date,
+    shift_start: time,
+    daily_horizon_min: int,
+) -> list[dict[str, Any]]:
+    segments = []
+    segment_start = task.start_min
+    segment_index = 1
 
-def _format_result(result, plan_date: date, horizon_min: int, shift_start: time) -> dict[str, Any]:
+    while segment_start < task.end_min:
+        current_day_end = (
+            (segment_start // daily_horizon_min) + 1
+        ) * daily_horizon_min
+
+        segment_end = min(task.end_min, current_day_end)
+
+        start_dt = _slot_to_datetime(
+            plan_date,
+            shift_start,
+            daily_horizon_min,
+            segment_start,
+        )
+        end_dt = _slot_to_datetime(
+            plan_date,
+            shift_start,
+            daily_horizon_min,
+            segment_end,
+            is_end=True,
+        )
+
+        segments.append({
+            "order_id":       task.order_id,
+            "part_number":    task.part_number,
+            "step_order":     task.step_order,
+            "process":        task.process_name,
+            "machine_id":     task.machine_id,
+            "segment_index":  segment_index,
+            "start_date":     start_dt.date().isoformat(),
+            "end_date":       end_dt.date().isoformat(),
+            "start_time":     start_dt.strftime("%H:%M"),
+            "end_time":       end_dt.strftime("%H:%M"),
+            "duration_min":   segment_end - segment_start,
+            "total_task_min": task.duration_min,
+            "quantity":       task.quantity,
+        })
+
+        segment_start = segment_end
+        segment_index += 1
+
+    segment_count = len(segments)
+    for segment in segments:
+        segment["segment_count"] = segment_count
+
+    return segments
+
+
+def _format_result(result, plan_date: date, horizon_min: int, shift_start: time, daily_horizon_min: int) -> dict[str, Any]:
     """Convierte ScheduleResult a dict serializable con horas reales del día."""
-    dummy   = date(2000, 1, 1)
-    dt_base = datetime.combine(dummy, shift_start)
-
     tasks = []
     for task in result.tasks:
-        start_dt = dt_base + timedelta(minutes=task.start_min)
-        end_dt   = dt_base + timedelta(minutes=task.end_min)
-        tasks.append({
-            "order_id":     task.order_id,
-            "part_number":  task.part_number,
-            "step_order":   task.step_order,
-            "process":      task.process_name,
-            "machine_id":   task.machine_id,
-            "start_time":   start_dt.strftime("%H:%M"),
-            "end_time":     end_dt.strftime("%H:%M"),
-            "duration_min": task.duration_min,
-            "quantity":     task.quantity,
-        })
+        tasks.extend(
+            _split_task_segments(
+                task,
+                plan_date,
+                shift_start,
+                daily_horizon_min,
+            )
+        )
+
 
     unscheduled_orders = [
         {
@@ -237,6 +307,7 @@ def _format_result(result, plan_date: date, horizon_min: int, shift_start: time)
         "plan_date":             plan_date.isoformat(),
         "horizon_min":           horizon_min,
         "tasks":                 tasks,
+        "daily_horizon_min":     daily_horizon_min,
         "makespan_min":          result.makespan_min,
         "unscheduled_order_ids": result.unscheduled_order_ids,
         "unscheduled_orders":    unscheduled_orders,

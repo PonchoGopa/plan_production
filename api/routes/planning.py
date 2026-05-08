@@ -98,6 +98,9 @@ def run_schedule():
         shift_start = _parse_time(body.get("shift_start"), "shift_start")
         shift_end   = _parse_time(body.get("shift_end"),   "shift_end")
         save_plan   = bool(body.get("save_plan", False))
+        horizon_days = int(body.get("horizon_days", 1))
+        if horizon_days < 1:
+            raise ValueError("'horizon_days' debe ser mayor o igual a 1.")
     except ValueError as exc:
         return _error(str(exc), 400)
 
@@ -107,6 +110,7 @@ def run_schedule():
         shift_start=shift_start,
         shift_end=shift_end,
         save_plan=save_plan,
+        horizon_days=horizon_days,
     )
 
     http_status = 500 if result["status"] == "ERROR" else 200
