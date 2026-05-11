@@ -140,7 +140,7 @@ def run_schedule(
 
         # ── Persistir si se solicitó ───────────────────────────────────────
         if save_plan and result.is_feasible:
-            _save_production_plan(conn, plan_date, t_start, result)
+            _save_production_plan(conn, plan_date, t_start, daily_horizon_min, result)
             conn.commit()
             logger.info("Plan persistido en production_plan.")
 
@@ -220,6 +220,8 @@ def _split_task_segments(
     segments = []
     segment_start = task.start_min
     segment_index = 1
+    remaining_quantity = task.quantity
+    remaining_duration = task.duration_min
 
     while segment_start < task.end_min:
         current_day_end = (
@@ -227,6 +229,14 @@ def _split_task_segments(
         ) * daily_horizon_min
 
         segment_end = min(task.end_min, current_day_end)
+        segment_duration = segment_end - segment_start
+
+        if segment_end == task.end_min:
+            segment_quantity = remaining_quantity
+        else:
+            segment_quantity = round(
+                remaining_quantity * segment_duration / remaining_duration
+            )
 
         start_dt = _slot_to_datetime(
             plan_date,
@@ -249,14 +259,19 @@ def _split_task_segments(
             "process":        task.process_name,
             "machine_id":     task.machine_id,
             "segment_index":  segment_index,
+            "spm":            task.spm,
             "start_date":     start_dt.date().isoformat(),
             "end_date":       end_dt.date().isoformat(),
             "start_time":     start_dt.strftime("%H:%M"),
             "end_time":       end_dt.strftime("%H:%M"),
-            "duration_min":   segment_end - segment_start,
+            "duration_min":   segment_duration,
             "total_task_min": task.duration_min,
-            "quantity":       task.quantity,
+            "quantity":       segment_quantity,
+            "total_quantity": task.quantity,
         })
+
+        remaining_quantity -= segment_quantity
+        remaining_duration -= segment_duration
 
         segment_start = segment_end
         segment_index += 1
@@ -320,14 +335,19 @@ def _save_production_plan(
     conn: MySQLConnection,
     plan_date: date,
     shift_start: time,
+    daily_horizon_min: int,
     result,
 ) -> None:
     """Persiste ScheduleResult en production_plan. Idempotente (borra antes de insertar)."""
     cursor  = conn.cursor()
-    dummy   = date(2000, 1, 1)
-    dt_base = datetime.combine(dummy, shift_start)
 
-    cursor.execute("DELETE FROM production_plan WHERE Date = %s", (plan_date.isoformat(),))
+    cursor.execute(
+        "DELETE FROM production_plan WHERE Date >= %s AND Date <= %s",
+        (
+            plan_date.isoformat(),
+            (plan_date + timedelta(days=max(0, result.makespan_min // daily_horizon_min))).isoformat(),
+        ),
+    )
     cursor.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM production_plan")
     next_id = int(cursor.fetchone()[0])
 
@@ -339,17 +359,42 @@ def _save_production_plan(
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     rows = []
-    for pos, task in enumerate(result.tasks, start=1):
-        start_dt = dt_base + timedelta(minutes=task.start_min)
-        end_dt   = dt_base + timedelta(minutes=task.end_min)
-        dur_min  = task.duration_min
-        hours    = round(dur_min / 60, 4)
-        rows.append((
-            next_id + pos - 1, plan_date.isoformat(), task.machine_id, task.part_number,
-            task.process_name, task.quantity,
-            start_dt.strftime("%H:%M:%S"), end_dt.strftime("%H:%M:%S"),
-            dur_min, pos, 0, 0, 0, hours, hours,
-        ))
+    next_id_offset = 0
+    positions_by_date: dict[str, int] = {}
+    for task in result.tasks:
+        segments = _split_task_segments(
+            task,
+            plan_date,
+            shift_start,
+            daily_horizon_min,
+        )
+
+        for segment in segments:
+            dur_min = segment["duration_min"]
+            hours = round(dur_min / 60, 4)
+            segment_date = segment["start_date"]
+            position = positions_by_date.get(segment_date, 0) + 1
+            positions_by_date[segment_date] = position
+
+            rows.append((
+                next_id + next_id_offset,
+                segment_date,
+                task.machine_id,
+                task.part_number,
+                task.process_name,
+                segment["quantity"],
+                f'{segment["start_time"]}:00',
+                f'{segment["end_time"]}:00',
+                dur_min,
+                position,
+                0,
+                int(round(task.spm or 0)),
+                0,
+                hours,
+                hours,
+            ))
+
+            next_id_offset += 1
 
     cursor.executemany(insert_sql, rows)
     cursor.close()

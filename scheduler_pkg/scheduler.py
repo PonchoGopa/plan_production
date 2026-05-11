@@ -294,7 +294,36 @@ class _TaskVar:
     step_order: int
     process_name: str
     machine_id: int
+    spm: float
 
+def _get_step_spm(
+    step: RouteStep,
+    order: Order,
+    parts: dict[str, Part],
+    fallback_spm: float = 8.0,
+) -> float:
+    """
+    Devuelve el SPM usado para calcular una tarea.
+
+    Prioridad:
+      1. SPM específico por proceso: part.process_spm[process_name]
+      2. SPM general de part_prod: part.spm_plan
+      3. Fallback conservador
+    """
+    part = parts.get(order.part_number)
+    if not part:
+        return fallback_spm
+
+    process_name = (step.process_name or "").strip().lower()
+    process_spm = part.process_spm.get(process_name)
+
+    if process_spm and process_spm > 0:
+        return float(process_spm)
+
+    if part.spm_plan and part.spm_plan > 0:
+        return float(part.spm_plan)
+
+    return fallback_spm
 
 def _compute_duration(
     step: RouteStep,
@@ -323,36 +352,29 @@ def _compute_duration(
         # Parte desconocida — estimación conservadora
         return step.setup_time_min + math.ceil(order.quantity / fallback_spm)
 
-    # 1. Buscar tiempo de ciclo exacto para esta máquina
-    # 1. Usar SPM_Plan desde part_prod como fuente principal.
-    # SPM_Plan significa piezas por minuto.
-    process_name = (step.process_name or "").strip().lower()
-    process_spm = part.process_spm.get(process_name)
+    spm = _get_step_spm(step, order, parts, fallback_spm)
 
-    if process_spm and process_spm > 0:
-        run_time_min = math.ceil(order.quantity / process_spm)
-
-    # 2. Usar SPM_Plan general desde part_prod como fallback.
-    elif part.spm_plan and part.spm_plan > 0:
-        run_time_min = math.ceil(order.quantity / part.spm_plan)
+    if spm and spm > 0:
+        run_time_min = math.ceil(order.quantity / spm)
 
     else:
-        # 3. Fallback: buscar tiempo de ciclo exacto para esta máquina.
+        # Fallback: buscar tiempo de ciclo exacto para esta máquina.
         ct = part.cycle_times.get(machine_id)
         if ct:
             run_time_min = math.ceil(order.quantity * ct.cycle_time_min)
 
-        # 4. Fallback: buscar cualquier tiempo de ciclo disponible para la parte.
+        # Fallback: buscar cualquier tiempo de ciclo disponible para la parte.
         elif part.cycle_times:
             fallback_cycle = next(iter(part.cycle_times.values())).cycle_time_min
             run_time_min = math.ceil(order.quantity * fallback_cycle)
 
-        # 5. Último fallback conservador.
+        # Último fallback conservador.
         else:
             run_time_min = math.ceil(order.quantity / fallback_spm)
 
     duration = step.setup_time_min + run_time_min
     return max(1, duration)
+
 
 
 
@@ -440,6 +462,7 @@ def build_model(
                     continue
 
                 duration = _compute_duration(step, order, parts, mid)
+                spm = _get_step_spm(step, order, parts)
 
                 # Variables de tiempo
                 start_var = model.NewIntVar(0, horizon, f"s_{order.id}_{step.step_order}_{mid}")
@@ -464,6 +487,7 @@ def build_model(
                     step_order=step.step_order,
                     process_name=step.process_name,
                     machine_id=mid,
+                    spm=spm,
                 )
                 task_vars[(order.id, step.step_order, mid)] = tv
                 step_task_vars.append(tv)
@@ -645,6 +669,7 @@ def _extract_results(
             start_min=solver.Value(tv.start),
             end_min=solver.Value(tv.end),
             quantity=order_qty.get(order_id, 0),
+            spm=tv.spm,
         )
         tasks.append(task)
         scheduled_order_ids.add(order_id)

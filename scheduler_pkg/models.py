@@ -131,6 +131,7 @@ class ScheduledTask:
     end_min: int
     quantity: int
     machine_name: str = ""      # Nombre legible de la máquina — llenado por scheduler
+    spm: float = 0.0
 
     @property
     def duration_min(self) -> int:
