@@ -172,10 +172,19 @@ def run_schedule(
 def get_stock_status(reference_date: date | None = None) -> dict[str, Any]:
     reference_date = reference_date or date.today()
     deadline = reference_date + timedelta(days=MIN_STOCK_DAYS)
+
     conn = _get_connection()
+    plex_conn = _get_plex_connection()
+
     try:
-        return get_stock_summary(conn, reference_date, deadline)
+        return get_stock_summary(
+            conn,
+            reference_date,
+            deadline,
+            plex_conn=plex_conn,
+        )
     finally:
+        plex_conn.close()
         conn.close()
 
 

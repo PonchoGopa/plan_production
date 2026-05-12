@@ -581,6 +581,104 @@ def load_orders_from_sales_releases(
 
     return orders
 
+def get_release_demand_summary(
+    conn: MySQLConnection,
+    reference_date: date,
+    deadline: date,
+) -> dict[str, dict[str, int]]:
+    """
+    Resume demanda desde plex_data.sales_v_release para stock.
+
+    Reglas:
+      - Ship Schedule se toma por rango exacto de Ship_Date.
+      - Forecast se toma desde el inicio del mes de reference_date
+        hasta el fin del mes de deadline, porque puede venir cargado
+        el día 1 con cantidad de todo el mes.
+    """
+    forecast_start = reference_date.replace(day=1)
+
+    if deadline.month == 12:
+        next_month = date(deadline.year + 1, 1, 1)
+    else:
+        next_month = date(deadline.year, deadline.month + 1, 1)
+
+    forecast_end = next_month - timedelta(days=1)
+
+    result: dict[str, dict[str, int]] = {}
+
+    ship_sql = """
+        SELECT
+            Part_No AS part_number,
+            SUM(COALESCE(Quantity, 0)) AS quantity
+        FROM sales_v_release
+        WHERE Ship_Date >= %s
+          AND Ship_Date <= %s
+          AND COALESCE(Release_Status, '') = 'Open'
+          AND Release_Type = 'Ship Schedule'
+        GROUP BY Part_No
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        ship_sql,
+        (reference_date.isoformat(), deadline.isoformat()),
+    )
+
+    for row in cursor.fetchall():
+        part_number = row["part_number"]
+        result.setdefault(part_number, {
+            "firm_qty": 0,
+            "forecast_qty": 0,
+            "target_qty": 0,
+        })
+        result[part_number]["firm_qty"] = int(row["quantity"] or 0)
+
+    cursor.close()
+
+    forecast_sql = """
+        SELECT
+            Part_No AS part_number,
+            SUM(COALESCE(Quantity, 0)) AS quantity
+        FROM sales_v_release
+        WHERE Ship_Date >= %s
+          AND Ship_Date <= %s
+          AND COALESCE(Release_Status, '') = 'Open'
+          AND Release_Type = 'Forecast'
+        GROUP BY Part_No
+    """
+
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        forecast_sql,
+        (forecast_start.isoformat(), forecast_end.isoformat()),
+    )
+
+    for row in cursor.fetchall():
+        part_number = row["part_number"]
+        result.setdefault(part_number, {
+            "firm_qty": 0,
+            "forecast_qty": 0,
+            "target_qty": 0,
+        })
+        result[part_number]["forecast_qty"] = int(row["quantity"] or 0)
+
+    cursor.close()
+
+    for values in result.values():
+        values["target_qty"] = values["firm_qty"] + values["forecast_qty"]
+
+    logger.info(
+        "get_release_demand_summary | ref=%s deadline=%s forecast_window=%s..%s partes=%d",
+        reference_date,
+        deadline,
+        forecast_start,
+        forecast_end,
+        len(result),
+    )
+
+    return result
+
+
 def load_quality_spm(
     conn: MySQLConnection,
 ) -> dict[str, float]:
@@ -692,6 +790,7 @@ def get_stock_summary(
     conn: MySQLConnection,
     reference_date: date,
     deadline: date,
+    plex_conn: MySQLConnection | None = None,
 ) -> dict[str, Any]:
     """
     Estado de stock por parte entre reference_date y deadline.
@@ -709,32 +808,62 @@ def get_stock_summary(
                    for r in cursor.fetchall()}
     cursor.close()
 
-    sql_target = """
-        SELECT s.Part_No AS part_number, s.Quantity AS target_qty
-        FROM   schedule s
-        INNER JOIN (
-            SELECT Part_No, MAX(Date) AS last_date
-            FROM   schedule
-            WHERE  Date <= %s
-            GROUP  BY Part_No
-        ) latest ON latest.Part_No = s.Part_No AND latest.last_date = s.Date
-    """
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute(sql_target, (deadline.isoformat(),))
-    target_map = {r["part_number"]: int(r["target_qty"] or 0)
-                  for r in cursor.fetchall()}
-    cursor.close()
+    firm_map: dict[str, int] = {}
+    forecast_map: dict[str, int] = {}
+
+    if plex_conn is not None:
+        demand_map = get_release_demand_summary(
+            plex_conn,
+            reference_date,
+            deadline,
+        )
+        target_map = {
+            part_number: values["target_qty"]
+            for part_number, values in demand_map.items()
+        }
+        firm_map = {
+            part_number: values["firm_qty"]
+            for part_number, values in demand_map.items()
+        }
+        forecast_map = {
+            part_number: values["forecast_qty"]
+            for part_number, values in demand_map.items()
+        }
+    else:
+        sql_target = """
+            SELECT s.Part_No AS part_number, s.Quantity AS target_qty
+            FROM   schedule s
+            INNER JOIN (
+                SELECT Part_No, MAX(Date) AS last_date
+                FROM   schedule
+                WHERE  Date <= %s
+                GROUP  BY Part_No
+            ) latest ON latest.Part_No = s.Part_No AND latest.last_date = s.Date
+        """
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(sql_target, (deadline.isoformat(),))
+        target_map = {
+            r["part_number"]: int(r["target_qty"] or 0)
+            for r in cursor.fetchall()
+        }
+        cursor.close()
 
     all_parts = set(planned_map) | set(target_map)
     parts = []
     for part in sorted(all_parts):
         planned = planned_map.get(part, 0)
         target  = target_map.get(part, 0)
+        firm_qty = firm_map.get(part, 0)
+        forecast_qty = forecast_map.get(part, 0)
+
         coverage_pct = round(planned / target * 100, 1) if target > 0 else (100.0 if planned > 0 else 0.0)
         status = "ok" if coverage_pct >= 100 else ("warning" if coverage_pct >= 50 else "critical")
+
         parts.append({
             "part_number":  part,
             "planned_qty":  planned,
+            "firm_qty":     firm_qty,
+            "forecast_qty": forecast_qty,
             "target_qty":   target,
             "coverage_pct": coverage_pct,
             "status":       status,
